@@ -4,6 +4,10 @@ A macOS CLI that mirrors and controls a jailbroken iPhone over USB.
 
 With one device attached, that is all you need. It connects on its own.
 
+<p align="center">
+  <img src="docs/assets/ioscpy-demo.gif" width="720" alt="ioscpy demo">
+</p>
+
 ## Install
 
 There are two sides. The Mac app runs the mirror, the iPhone package lets the
