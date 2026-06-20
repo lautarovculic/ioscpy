@@ -45,7 +45,9 @@ if [ "${#debs[@]}" -eq 0 ]; then
 fi
 
 # Fresh layout: out/debs holds the packages, the index files sit at the root.
-rm -rf "$out"
+# Clear the previous build but keep a .git folder if one is there, so out/ can
+# stay a checkout you push from without losing its history each rebuild.
+rm -rf "$out/debs" "$out"/Packages* "$out"/Release "$out"/CydiaIcon.png "$out"/index.html
 mkdir -p "$out/debs"
 for d in "${debs[@]}"; do
   cp "$d" "$out/debs/"
