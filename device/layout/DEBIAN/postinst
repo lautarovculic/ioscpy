@@ -1,0 +1,68 @@
+#!/bin/sh
+set -e
+
+# Resolve the active prefix from where dpkg installed the daemon, the same way the
+# runtime resolver does, so the plist points at the real binary on rootless
+# (/var/jb), rootful (""), or a roothide prefix ($JBROOT).
+if [ -x /var/jb/usr/bin/ioscpyd ]; then
+    PREFIX=/var/jb
+elif [ -n "$JBROOT" ] && [ -x "$JBROOT/usr/bin/ioscpyd" ]; then
+    PREFIX="$JBROOT"
+elif command -v jbroot >/dev/null 2>&1 && [ -x "$(jbroot / 2>/dev/null)/usr/bin/ioscpyd" ]; then
+    PREFIX="$(jbroot / 2>/dev/null)"
+    PREFIX="${PREFIX%/}"
+elif [ -x /usr/bin/ioscpyd ]; then
+    PREFIX=""
+else
+    echo "ioscpy: installed daemon not found; aborting" >&2
+    exit 1
+fi
+
+DAEMON="$PREFIX/usr/bin/ioscpyd"
+CTL="$PREFIX/usr/bin/ioscpyctl"
+LDDIR="$PREFIX/Library/LaunchDaemons"
+PLIST="$LDDIR/com.ioscpy.daemon.plist"
+LOGDIR="$PREFIX/var/log/ioscpy"
+
+mkdir -p "$LDDIR" "$LOGDIR"
+chmod 755 "$DAEMON" "$CTL" 2>/dev/null || true
+chown root:wheel "$DAEMON" "$CTL" 2>/dev/null || true
+
+cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ioscpy.daemon</string>
+	<key>Program</key>
+	<string>$DAEMON</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$DAEMON</string>
+	</array>
+	<key>UserName</key>
+	<string>root</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>$LOGDIR/ioscpyd.log</string>
+	<key>StandardErrorPath</key>
+	<string>$LOGDIR/ioscpyd.log</string>
+</dict>
+</plist>
+PLISTEOF
+chmod 644 "$PLIST"
+plutil -lint "$PLIST" >/dev/null 2>&1 || true
+
+# (Re)load the daemon through launchd. enable in case the label was left disabled,
+# else kickstart silently won't start it.
+launchctl bootout system "$PLIST" 2>/dev/null || true
+launchctl enable system/com.ioscpy.daemon 2>/dev/null || true
+launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null || true
+launchctl kickstart -k system/com.ioscpy.daemon 2>/dev/null || true
+
+echo "ioscpy installed. Respring to load the tweak."
+exit 0

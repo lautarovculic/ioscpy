@@ -1,0 +1,32 @@
+# Rust / host
+host/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Theos / device build artifacts
+device/.theos/
+device/**/.theos/
+device/obj/
+device/**/obj/
+device/packages/
+device/**/*.deb
+.theos/
+
+# macOS
+.DS_Store
+
+# Editor and local tooling state, not part of the project
+.vscode/
+.idea/
+*.local.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Secrets. Never commit device credentials, keys, or session tokens.
+*.pem
+id_rsa*
+*.token
+secrets.env
+.env
