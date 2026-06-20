@@ -12,6 +12,9 @@ device/packages/
 device/**/*.deb
 .theos/
 
+# Generated Sileo/Zebra repo output
+packaging/repo/out/
+
 # macOS
 .DS_Store
 

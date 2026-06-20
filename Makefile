@@ -2,7 +2,7 @@
 # Author: Lautaro Villarreal Culic' (https://lautarovculic.com)
 
 .PHONY: all host host-release install-host uninstall-host device device-rootless \
-        device-rootful device-roothide release clean fmt clippy test help
+        device-rootful device-roothide release repo clean fmt clippy test help
 
 PREFIX ?= /usr/local
 
@@ -45,6 +45,10 @@ device-roothide:
 
 device: device-rootless
 
+## Packaging
+repo:
+	packaging/repo/build-repo.sh
+
 ## Combined
 release: host-release device-rootless device-rootful
 
@@ -58,6 +62,7 @@ help:
 	@echo "  make install-host      install ioscpy to $(PREFIX)/bin (on PATH)"
 	@echo "  make device-rootless   build rootless .deb (/var/jb)"
 	@echo "  make device-rootful    build rootful .deb (/)"
+	@echo "  make repo              build the Sileo/Zebra repo from the .deb"
 	@echo "  make release           host-release + both device variants"
 	@echo "  make fmt|clippy|test   host lint/test"
 	@echo "  make clean             clean host + device"
