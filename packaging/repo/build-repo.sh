@@ -53,6 +53,7 @@ for d in "${debs[@]}"; do
 done
 
 cp "$here/CydiaIcon.png" "$out/CydiaIcon.png"
+cp "$here/index.html" "$out/index.html"
 
 # Read the architectures present in the packages (iphoneos-arm for rootful,
 # iphoneos-arm64 for rootless) so the Release line advertises every variant.

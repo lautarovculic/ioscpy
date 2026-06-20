@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ioscpy repository</title>
+  <style>
+    :root {
+      --bg: #000000;
+      --card: #0a0a0a;
+      --line: #2a2a2a;
+      --text: #ffffff;
+      --muted: #9a9a9a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    .card {
+      width: 100%;
+      max-width: 440px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 32px;
+      text-align: center;
+    }
+    .icon {
+      width: 96px;
+      height: 96px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+    }
+    h1 { margin: 18px 0 4px; font-size: 26px; }
+    p.lead { margin: 0 0 24px; color: var(--muted); }
+    .btn {
+      display: block;
+      width: 100%;
+      margin: 10px 0;
+      padding: 13px 16px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #21262d;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .btn.primary { background: #ffffff; border-color: #ffffff; color: #000000; }
+    .url {
+      margin-top: 22px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #000000;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      word-break: break-all;
+      cursor: pointer;
+    }
+    .hint { margin-top: 8px; font-size: 12px; color: var(--muted); }
+    footer { margin-top: 26px; font-size: 13px; color: var(--muted); }
+    footer a { color: var(--text); text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img class="icon" src="CydiaIcon.png" alt="ioscpy">
+    <h1>ioscpy</h1>
+    <p class="lead">Mirror and control a jailbroken iPhone from macOS over USB.</p>
+
+    <a class="btn primary" id="sileo" href="#">Add to Sileo</a>
+    <a class="btn" id="zebra" href="#">Add to Zebra</a>
+
+    <div class="url" id="url" title="Tap to copy"></div>
+    <div class="hint">Tap the address to copy it, then add it by hand if the buttons do not open your package manager.</div>
+
+    <footer>
+      The Mac app installs with Homebrew. See the
+      <a href="https://github.com/lautarovculic/ioscpy">project on GitHub</a>.
+    </footer>
+  </main>
+
+  <script>
+    // Use whatever address this page is served from, so the links stay correct
+    // even if the repository is moved to another host later.
+    var repo = location.origin + location.pathname.replace(/index\.html$/, "");
+    if (repo.charAt(repo.length - 1) !== "/") repo += "/";
+
+    document.getElementById("url").textContent = repo;
+    document.getElementById("sileo").href = "sileo://source/" + repo;
+    document.getElementById("zebra").href = "zbra://sources/add/" + repo;
+
+    document.getElementById("url").addEventListener("click", function () {
+      navigator.clipboard && navigator.clipboard.writeText(repo);
+    });
+  </script>
+</body>
+</html>
