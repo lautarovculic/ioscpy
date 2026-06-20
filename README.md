@@ -3,6 +3,15 @@
 A macOS CLI that mirrors and controls a jailbroken iPhone over USB.
 With one device attached, that is all you need. It connects on its own.
 
+## Install
+
+```bash
+brew tap lautarovculic/ioscpy
+brew trust lautarovculic/ioscpy
+brew install ioscpy
+ioscpy --version
+```
+
 ```bash
 ioscpy --device <UDID>   # pick a device when several are attached
 ioscpy --list            # list attached devices
