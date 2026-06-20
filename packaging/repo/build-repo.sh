@@ -24,7 +24,6 @@ out="${IOSCPY_REPO_OUT:-$here/out}"
 origin="${IOSCPY_REPO_ORIGIN:-ioscpy}"
 label="${IOSCPY_REPO_LABEL:-ioscpy}"
 desc="${IOSCPY_REPO_DESC:-Mirror and control a jailbroken iPhone from macOS over USB.}"
-archs="${IOSCPY_REPO_ARCHS:-iphoneos-arm64}"
 
 if ! command -v dpkg-scanpackages >/dev/null 2>&1; then
   echo "dpkg-scanpackages not found. Install it with: brew install dpkg" >&2
@@ -54,6 +53,14 @@ for d in "${debs[@]}"; do
 done
 
 cp "$here/CydiaIcon.png" "$out/CydiaIcon.png"
+
+# Read the architectures present in the packages (iphoneos-arm for rootful,
+# iphoneos-arm64 for rootless) so the Release line advertises every variant.
+# Sileo and Zebra then show each device only the build that fits its jailbreak.
+detected="$(for d in "$out"/debs/*.deb; do dpkg-deb -f "$d" Architecture; done \
+  | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+archs="${IOSCPY_REPO_ARCHS:-$detected}"
+echo "architectures: $archs"
 
 # Build the package index. Filename: paths come out as debs/<name>.deb.
 cd "$out"

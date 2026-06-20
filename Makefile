@@ -31,17 +31,18 @@ clippy:
 test:
 	cd host && cargo test
 
-## Device (Theos)
+## Device (Theos). FINALPACKAGE=1 builds clean release .deb files (no debug
+## suffix), which is what gets installed and shipped.
 device-rootless:
-	cd device && $(MAKE) package THEOS_PACKAGE_SCHEME=rootless
+	cd device && $(MAKE) package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
 
 device-rootful:
-	cd device && $(MAKE) package
+	cd device && $(MAKE) package FINALPACKAGE=1
 
 device-roothide:
 	# Needs the roothide Theos fork installed (THEOS with the roothide scheme);
 	# a plain Theos falls back to a rootful build, which won't load on roothide.
-	cd device && $(MAKE) package THEOS_PACKAGE_SCHEME=roothide
+	cd device && $(MAKE) package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
 
 device: device-rootless
 
