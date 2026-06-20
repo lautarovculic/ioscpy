@@ -37,6 +37,13 @@ ioscpy --debug           # full diagnostics
 ioscpy --version
 ```
 
+## First touch
+
+> After a respring or a fresh connection, give the phone one physical tap on its
+> screen before driving it from the Mac. iOS only trusts touch events that come
+> from the real digitizer, so that first real tap is what lets the injected ones
+> through. You do it once, then the Mac takes over.
+
 ## Controls
 
 - Mouse: click to tap, click and drag to swipe.
