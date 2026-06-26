@@ -25,7 +25,11 @@
 #define IOSPY_VIDEO_ORIENT_SHIFT  3
 #define IOSPY_VIDEO_ORIENT_MASK   0x18u
 
-// START_STREAM codec selector (1-byte payload; empty payload also means MJPEG).
+// START_STREAM payload:
+//   byte 0: codec selector (0/empty = MJPEG, 1 = H.264)
+//   bytes 1-2: optional max capture dimension, big-endian u16 (0 = tweak default)
+//   byte 3: optional fps cap (0 = tweak default)
+//   byte 4: optional JPEG quality percent 1..100 (0 = tweak default)
 #define IOSPY_VIDEO_CODEC_MJPEG   0
 #define IOSPY_VIDEO_CODEC_H264    1
 

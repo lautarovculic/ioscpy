@@ -4,9 +4,10 @@
 //! A native usbmux client could replace the `iproxy` child later, the API
 //! (`start` / `connect` / `local_port`) wouldn't change.
 
+use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
+use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +15,7 @@ use anyhow::{bail, Context, Result};
 /// A live USB port forward from a local TCP port to a device port over usbmux.
 pub struct UsbForward {
     child: Child,
+    stderr_log: Option<JoinHandle<()>>,
     pub local_port: u16,
     pub device_port: u16,
 }
@@ -44,15 +46,22 @@ impl UsbForward {
         let local_port = free_local_port()?;
         let pair = format!("{local_port}:{device_port}");
 
-        let mut child = Command::new("iproxy")
-            .arg(&pair)
+        let mut cmd = Command::new("iproxy");
+        cmd.arg(&pair)
             .arg("-u")
             .arg(udid)
             .arg("-l") // USB device only, never network
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::null());
+        if crate::logging::debug_enabled() {
+            cmd.stderr(Stdio::piped());
+        } else {
+            cmd.stderr(Stdio::null());
+        }
+
+        let mut child = cmd
             .spawn()
             .context("couldn't start the USB link. The USB tools are missing. Install them with:  brew install libimobiledevice")?;
+        let stderr_log = spawn_stderr_logger(&mut child, &pair);
 
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {
@@ -71,6 +80,7 @@ impl UsbForward {
 
         Ok(Self {
             child,
+            stderr_log,
             local_port,
             device_port,
         })
@@ -85,10 +95,35 @@ impl UsbForward {
     }
 }
 
+fn spawn_stderr_logger(child: &mut Child, pair: &str) -> Option<JoinHandle<()>> {
+    let stderr = child.stderr.take()?;
+    let pair = pair.to_string();
+    Some(thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    let line = line.trim_end();
+                    if !line.is_empty() {
+                        crate::debug!("iproxy[{pair}] stderr: {line}");
+                    }
+                }
+                Err(e) => {
+                    crate::debug!("iproxy[{pair}] stderr read failed: {e}");
+                    break;
+                }
+            }
+        }
+    }))
+}
+
 impl Drop for UsbForward {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(stderr_log) = self.stderr_log.take() {
+            let _ = stderr_log.join();
+        }
     }
 }
 

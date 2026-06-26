@@ -48,4 +48,11 @@
     return result;
 }
 
+- (uint64_t)currentSequence {
+    [_cond lock];
+    uint64_t seq = _seq;
+    [_cond unlock];
+    return seq;
+}
+
 @end

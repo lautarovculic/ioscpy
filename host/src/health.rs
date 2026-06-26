@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::codec::CodecChoice;
 use crate::h264::{Decoded, H264Decoder};
 use crate::input::InputFrame;
 use crate::protocol::{self, Capabilities, HelloAck, LogMessage, MessageType, CHANNEL_CONTROL};
@@ -66,7 +67,7 @@ pub fn run_session(
     frame_sink: Option<FrameSlot>,
     input_rx: Option<&Receiver<InputFrame>>,
     clip_in: Option<&Sender<String>>,
-    codec: u8,
+    codec_choice: CodecChoice,
     suppress_keyboard: bool,
 ) -> Result<SessionEnd> {
     stream.set_read_timeout(None).ok();
@@ -74,14 +75,15 @@ pub fn run_session(
     let mut reader = stream.try_clone().context("clone control stream")?;
 
     // Ask the daemon to start streaming once we have somewhere to show it. The
-    // one-byte payload picks the codec.
+    // payload starts with the codec and may carry conservative capture knobs for
+    // device/OS combinations that are unstable under the legacy 1600px/45fps path.
     if frame_sink.is_some() {
         let _ = protocol::write_frame(
             &mut writer,
             MessageType::StartStream,
             CHANNEL_CONTROL,
             0,
-            &[codec],
+            &crate::codec::start_stream_payload(codec_choice),
         );
     }
 
@@ -109,6 +111,7 @@ pub fn run_session(
     let sink = frame_sink.clone();
     let reader_count = video_count.clone();
     let reader_keyframe = want_keyframe.clone();
+    let reader_stop = stop.clone();
     let reader_handle = thread::spawn(move || {
         // H.264 is stateful, so we decode here, in order, as frames arrive (can't
         // keep latest and decode later). The decoder is built on the first H.264
@@ -157,8 +160,10 @@ pub fn run_session(
                     }
                 }
                 Err(e) => {
-                    crate::warn!("reader stopped: {e}");
-                    let _ = tx.send(Incoming::Disconnected);
+                    if !reader_stop.load(Ordering::Relaxed) {
+                        crate::warn!("reader stopped: {e}");
+                        let _ = tx.send(Incoming::Disconnected);
+                    }
                     break;
                 }
             }
@@ -197,7 +202,15 @@ pub fn run_session(
             }
         }
 
-        if last_ping.elapsed() >= ping_every {
+        // Video frames are already a high-frequency liveness signal. While they
+        // are flowing, avoid extra ping/pong writes on the control stream; older
+        // usbmux/device combinations have proven sensitive to needless duplex
+        // control traffic during capture startup.
+        let video_recent = streaming && last_video_progress.elapsed() <= ping_every;
+        if video_recent {
+            last_pong = Instant::now();
+        }
+        if !video_recent && last_ping.elapsed() >= ping_every {
             if protocol::write_frame(&mut writer, MessageType::Ping, CHANNEL_CONTROL, seq, &[])
                 .is_err()
             {
@@ -275,6 +288,20 @@ pub fn run_session(
             break SessionEnd::Lost;
         }
     };
+
+    // Stop capture before tearing down the USB control socket. On older devices,
+    // closing the socket while SpringBoard is still pushing frames can destabilize
+    // usbmux/lockdown; bench/snapshot already stop explicitly, so do the same for
+    // the live session loop.
+    if streaming {
+        let _ = protocol::write_frame(
+            &mut writer,
+            MessageType::StopStream,
+            CHANNEL_CONTROL,
+            0,
+            &[],
+        );
+    }
 
     // Restore the device keyboard if we hid it. Best-effort: the device also
     // restores on disconnect, so a failed write here is harmless.

@@ -14,13 +14,14 @@
 // Whether a tweak is currently connected and able to stream.
 - (BOOL)tweakConnected;
 
-// Tell the tweak to begin capturing with a codec (0 = MJPEG, 1 = H.264) / stop.
-- (void)tellTweakStartCodec:(uint8_t)codec;
+// Tell the tweak to begin capturing with a START_STREAM payload / stop.
+- (void)tellTweakStartPayload:(NSData *)payload;
 - (void)tellTweakStop;
 
 // Choose how incoming video frames reach the host. MJPEG (NO) keeps only the
-// latest frame and drops under backpressure. H.264 (YES) forwards every frame in
-// order so the inter-frame stream stays intact.
+// latest frame and drops under backpressure. H.264 (YES) forwards actual H.264
+// frames in order so the inter-frame stream stays intact; actual MJPEG fallback
+// frames are still sent non-blocking/droppable.
 - (void)setVideoReliable:(BOOL)reliable;
 
 // Forward a control frame (e.g. input/system action) to the tweak.

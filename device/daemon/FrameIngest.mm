@@ -9,6 +9,16 @@
 #import <unistd.h>
 #import <errno.h>
 
+static BOOL IOSPYVideoPayloadIsH264(NSData *payload) {
+    if (payload.length < 16) {
+        return NO;
+    }
+    const uint8_t *bytes = (const uint8_t *)payload.bytes;
+    uint32_t flags = 0;
+    memcpy(&flags, bytes + 8, sizeof(flags));
+    return (ntohl(flags) & IOSPY_VIDEO_FLAG_H264) != 0;
+}
+
 @implementation IOSPYFrameIngest {
     uint16_t _port;
     int _listenFd;
@@ -16,7 +26,9 @@
     NSLock *_writeLock; // guards _tweakFd and writes to it
     int _hostFd;        // the control server's host socket, -1 when none
     NSLock *_hostLock;  // the control server's per-connection write lock
-    BOOL _videoReliable; // YES while an H.264 stream needs in-order delivery
+    BOOL _videoReliable; // YES when the host requested H.264/in-order delivery
+    BOOL _loggedMJPEGFallback;
+    BOOL _loggedReliableVideoFailure;
 }
 
 + (instancetype)shared {
@@ -48,6 +60,8 @@
 - (void)setVideoReliable:(BOOL)reliable {
     @synchronized(self) {
         _videoReliable = reliable;
+        _loggedMJPEGFallback = NO;
+        _loggedReliableVideoFailure = NO;
     }
 }
 
@@ -119,11 +133,12 @@
                 break;
             }
             if (header.type == IOSPYMsgVideoFrame && payload.length > 0) {
-                BOOL reliable;
+                BOOL requestedReliable;
                 @synchronized(self) {
-                    reliable = _videoReliable;
+                    requestedReliable = _videoReliable;
                 }
-                if (reliable) {
+                BOOL actualH264 = IOSPYVideoPayloadIsH264(payload);
+                if (requestedReliable && actualH264) {
                     // H.264: send every frame to the host in order. A blocking
                     // write backpressures the tweak's encoder instead of dropping
                     // a frame, which would corrupt the inter-frame stream.
@@ -143,9 +158,39 @@
                     }
                     if (hostFd >= 0 && hostLock) {
                         [hostLock lock];
-                        IOSPYWriteFrame(hostFd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0, payload);
+                        BOOL ok = IOSPYWriteFrame(hostFd, IOSPYMsgVideoFrame,
+                                                 IOSPY_CHANNEL_VIDEO, 0, payload);
                         [hostLock unlock];
+                        if (!ok) {
+                            BOOL shouldLog = NO;
+                            @synchronized(self) {
+                                if (!_loggedReliableVideoFailure) {
+                                    _loggedReliableVideoFailure = YES;
+                                    shouldLog = YES;
+                                }
+                            }
+                            if (shouldLog) {
+                                NSLog(@"[ioscpyd] reliable H.264 video write failed");
+                            }
+                        }
                     }
+                } else if (requestedReliable) {
+                    // The host asked for H.264, but the tweak fell back to MJPEG
+                    // (JPEG frames have no H.264 flag). Do not run these large
+                    // frames through the reliable/blocking H.264 path. Put them
+                    // into the latest-frame store; the pump forwards them
+                    // non-blocking/droppable just like a native MJPEG stream.
+                    BOOL shouldLog = NO;
+                    @synchronized(self) {
+                        if (!_loggedMJPEGFallback) {
+                            _loggedMJPEGFallback = YES;
+                            shouldLog = YES;
+                        }
+                    }
+                    if (shouldLog) {
+                        NSLog(@"[ioscpyd] H.264 request is producing MJPEG; using latest-frame forwarding");
+                    }
+                    [[IOSPYFrameStore shared] setPayload:payload];
                 } else {
                     // MJPEG: keep only the latest frame, the pump drops stale ones.
                     [[IOSPYFrameStore shared] setPayload:payload];
@@ -179,11 +224,10 @@
     return connected;
 }
 
-- (void)tellTweakStartCodec:(uint8_t)codec {
+- (void)tellTweakStartPayload:(NSData *)payload {
     [_writeLock lock];
     if (_tweakFd >= 0) {
-        NSData *p = [NSData dataWithBytes:&codec length:1];
-        IOSPYWriteFrame(_tweakFd, IOSPYMsgStartStream, IOSPY_CHANNEL_CONTROL, 0, p);
+        IOSPYWriteFrame(_tweakFd, IOSPYMsgStartStream, IOSPY_CHANNEL_CONTROL, 0, payload);
     }
     [_writeLock unlock];
 }

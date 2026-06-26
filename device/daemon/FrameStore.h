@@ -15,4 +15,8 @@
 // otherwise return nil and leave *seq untouched.
 - (NSData *)payloadNewerThan:(uint64_t *)seq;
 
+// Snapshot the current sequence so a new pump waits for frames from this stream
+// instead of immediately replaying the previous stream's last MJPEG frame.
+- (uint64_t)currentSequence;
+
 @end

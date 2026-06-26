@@ -30,6 +30,10 @@ pub struct Cli {
     #[arg(long)]
     pub mjpeg: bool,
 
+    /// Force H.264, bypassing conservative device defaults (debugging only).
+    #[arg(long, hide = true, conflicts_with = "mjpeg")]
+    pub h264: bool,
+
     /// Hide the on-screen iOS keyboard while connected, so the mirror shows the
     /// full screen (you type from the Mac; the device acts as if a hardware
     /// keyboard is attached). The keyboard returns when ioscpy exits. iOS 16+.
@@ -73,5 +77,29 @@ pub struct Cli {
 impl Cli {
     pub fn parse_args() -> Self {
         Cli::parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn hidden_h264_override_parses_but_stays_out_of_help() {
+        let cli = Cli::try_parse_from(["ioscpy", "--h264"]).unwrap();
+        assert!(cli.h264);
+        assert!(!cli.mjpeg);
+
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(!help.contains("--h264"));
+        assert!(help.contains("--mjpeg"));
+    }
+
+    #[test]
+    fn h264_override_conflicts_with_mjpeg() {
+        let err = Cli::try_parse_from(["ioscpy", "--h264", "--mjpeg"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

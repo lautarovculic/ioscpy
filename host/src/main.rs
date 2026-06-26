@@ -6,6 +6,7 @@
 
 mod cli;
 mod clipboard;
+mod codec;
 mod config;
 mod device;
 mod h264;
@@ -233,13 +234,12 @@ fn run_connection_loop(
             info!("session live. Press Ctrl-C to quit");
         }
 
-        // Use H.264 when the device offers it and the user didn't force MJPEG.
-        // The daemon also falls back to MJPEG if it can't honor the request.
-        let codec = if !cli.mjpeg && ack.capabilities.stream_backends.iter().any(|b| b == "h264") {
-            protocol::VIDEO_CODEC_H264
-        } else {
-            protocol::VIDEO_CODEC_MJPEG
-        };
+        let codec_choice = choose_stream_codec(cli, &ack.capabilities);
+        debug!(
+            "requesting {} stream ({:?})",
+            codec::codec_name(codec_choice.codec),
+            codec_choice.reason
+        );
 
         // Only hide the device keyboard if asked and the tweak can do it.
         let suppress_keyboard = cli.no_keyboard && ack.capabilities.keyboard;
@@ -250,7 +250,7 @@ fn run_connection_loop(
             frame_sink.clone(),
             input_rx.as_ref(),
             clip_in.as_ref(),
-            codec,
+            codec_choice,
             suppress_keyboard,
         )? {
             health::SessionEnd::Quit => break,
@@ -325,25 +325,17 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     if ack.capabilities.stream_backends.is_empty() {
         warn!("the phone side isn't fully up yet, so the screen might not show. Respring the phone (or reinstall ioscpy from Sileo) and reconnect.");
     }
-    let codec = if !cli.mjpeg && ack.capabilities.stream_backends.iter().any(|b| b == "h264") {
-        protocol::VIDEO_CODEC_H264
-    } else {
-        protocol::VIDEO_CODEC_MJPEG
-    };
+    let codec_choice = choose_stream_codec(cli, &ack.capabilities);
     println!(
         "bench: requesting {} stream",
-        if codec == protocol::VIDEO_CODEC_H264 {
-            "h264"
-        } else {
-            "mjpeg"
-        }
+        codec::codec_name(codec_choice.codec)
     );
     protocol::write_frame(
         &mut stream,
         protocol::MessageType::StartStream,
         protocol::CHANNEL_CONTROL,
         0,
-        &[codec],
+        &codec::start_stream_payload(codec_choice),
     )?;
     // Ask for a keyframe so H.264 decodes from the first frame.
     let _ = protocol::write_frame(
@@ -522,6 +514,18 @@ fn establish(
     let stream = forward.connect()?;
     *forward_slot = Some(forward);
     Ok(stream)
+}
+
+/// Map CLI codec flags to the shared host-side codec policy.
+fn choose_stream_codec(cli: &Cli, caps: &protocol::Capabilities) -> codec::CodecChoice {
+    let preference = if cli.mjpeg {
+        codec::CodecPreference::Mjpeg
+    } else if cli.h264 {
+        codec::CodecPreference::H264
+    } else {
+        codec::CodecPreference::Auto
+    };
+    codec::choose_stream_codec(caps, preference)
 }
 
 /// The protocol version must match. A different build version is just noted under

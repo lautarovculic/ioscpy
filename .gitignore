@@ -14,6 +14,7 @@ device/**/*.deb
 
 # Generated Sileo/Zebra repo output
 packaging/repo/out/
+dist/
 
 # macOS
 .DS_Store

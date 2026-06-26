@@ -174,42 +174,41 @@ NSString *const IOSPYDaemonVersion = @"0.1.0";
                     BOOL h264 = (codec == IOSPY_VIDEO_CODEC_H264);
                     streaming = YES;
                     [[IOSPYFrameIngest shared] setVideoReliable:h264];
-                    [[IOSPYFrameIngest shared] tellTweakStartCodec:codec];
+                    [[IOSPYFrameIngest shared] tellTweakStartPayload:payload];
                     NSLog(@"[ioscpyd] stream started (codec=%s)", h264 ? "h264" : "mjpeg");
-                    if (!h264) {
-                        // MJPEG: latest-only pump that drops stale frames under
-                        // backpressure so motion stays smooth. H.264 goes out in
-                        // order straight from the ingest thread instead.
-                        pumpDone = dispatch_semaphore_create(0);
-                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                            uint64_t lastSeq = 0;
-                            while (alive && streaming) {
-                                // Drain the frame payloads each iteration so memory
-                                // doesn't climb on this long-lived block, or jetsam
-                                // kills the daemon.
-                                @autoreleasepool {
-                                    // Blocks until a new frame is ready, or a short
-                                    // timeout so we can re-check the run state.
-                                    NSData *frame =
-                                        [[IOSPYFrameStore shared] payloadNewerThan:&lastSeq];
-                                    if (!frame) {
-                                        continue;
-                                    }
-                                    [writeLock lock];
-                                    // Non-blocking: if the host is behind, this
-                                    // frame is dropped (rc == 0) and the loop grabs
-                                    // the newest next, so latency stays about a frame.
-                                    int rc = IOSPYTryWriteFrame(fd, IOSPYMsgVideoFrame,
-                                                                IOSPY_CHANNEL_VIDEO, lastSeq, frame);
-                                    [writeLock unlock];
-                                    if (rc < 0) {
-                                        break;
-                                    }
+                    // MJPEG/latest-only pump. Native MJPEG streams use it
+                    // directly; if H.264 later falls back to MJPEG, FrameIngest
+                    // routes those actual JPEG frames here too. Actual H.264
+                    // frames still go out in order straight from the ingest thread.
+                    pumpDone = dispatch_semaphore_create(0);
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        uint64_t lastSeq = [[IOSPYFrameStore shared] currentSequence];
+                        while (alive && streaming) {
+                            // Drain the frame payloads each iteration so memory
+                            // doesn't climb on this long-lived block, or jetsam
+                            // kills the daemon.
+                            @autoreleasepool {
+                                // Blocks until a new frame is ready, or a short
+                                // timeout so we can re-check the run state.
+                                NSData *frame = [[IOSPYFrameStore shared] payloadNewerThan:&lastSeq];
+                                if (!frame) {
+                                    continue;
+                                }
+                                [writeLock lock];
+                                // Non-blocking: if the host is behind, this frame
+                                // is dropped (rc == 0) and the loop grabs the newest
+                                // next, so latency stays about a frame.
+                                int rc = IOSPYTryWriteFrame(fd, IOSPYMsgVideoFrame,
+                                                            IOSPY_CHANNEL_VIDEO, lastSeq, frame);
+                                [writeLock unlock];
+                                if (rc < 0) {
+                                    NSLog(@"[ioscpyd] latest-frame video write failed");
+                                    break;
                                 }
                             }
-                            dispatch_semaphore_signal(pumpDone);
-                        });
-                    }
+                        }
+                        dispatch_semaphore_signal(pumpDone);
+                    });
                 }
                 break;
             case IOSPYMsgStopStream:

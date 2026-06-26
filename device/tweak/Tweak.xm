@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <signal.h>
 
 #import "StreamClient.h"
 #import "InputInjector.h"
@@ -57,6 +58,10 @@ static BOOL gSuppressPasteAlert = NO;
 
 %ctor {
     @autoreleasepool {
+        // SpringBoard must not die if the daemon/host side closes a socket while
+        // the tweak is writing a frame or clipboard update.
+        signal(SIGPIPE, SIG_IGN);
+
         NSString *process = [[NSProcessInfo processInfo] processName];
         NSLog(@"[ioscpyhook] loaded into %@ (v0.1.0)", process);
 

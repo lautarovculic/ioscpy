@@ -15,9 +15,13 @@
 // Capture tuning. We aim high on rate and let the serial capture queue settle the
 // real fps to whatever the device can sustain. Longest side is capped for
 // bandwidth and CPU.
-static const CGFloat kMaxDimension = 1600.0;
-static const CGFloat kQuality = 0.72;
-static const NSTimeInterval kInterval = 1.0 / 45.0;
+static const CGFloat kDefaultMaxDimension = 1600.0;
+static const CGFloat kDefaultQuality = 0.72;
+static const NSTimeInterval kDefaultInterval = 1.0 / 45.0;
+static const uint16_t kMinMaxDimension = 320;
+static const uint16_t kMaxMaxDimension = 1600;
+static const uint8_t kMinFps = 1;
+static const uint8_t kMaxFps = 60;
 
 // clipboard sync bookkeeping (must hash byte-identically to the host)
 static uint64_t gLastSyncedHash = 0;
@@ -36,6 +40,33 @@ static uint64_t clipHash(NSString *t) {
     return h;
 }
 
+static uint16_t readBE16(const uint8_t *bytes) {
+    return (uint16_t)(((uint16_t)bytes[0] << 8) | bytes[1]);
+}
+
+static CGFloat streamMaxDimension(uint16_t requested) {
+    if (requested == 0) {
+        return kDefaultMaxDimension;
+    }
+    return (CGFloat)MIN(MAX(requested, kMinMaxDimension), kMaxMaxDimension);
+}
+
+static NSTimeInterval streamInterval(uint8_t requestedFps) {
+    if (requestedFps == 0) {
+        return kDefaultInterval;
+    }
+    uint8_t fps = MIN(MAX(requestedFps, kMinFps), kMaxFps);
+    return 1.0 / (NSTimeInterval)fps;
+}
+
+static CGFloat streamQuality(uint8_t requestedPercent) {
+    if (requestedPercent == 0) {
+        return kDefaultQuality;
+    }
+    uint8_t percent = MIN(MAX(requestedPercent, 1), 100);
+    return (CGFloat)percent / 100.0;
+}
+
 @interface IOSPYStreamClient ()
 - (void)startClipboardObserver;
 - (void)checkClipboard;
@@ -51,6 +82,9 @@ static uint64_t clipHash(NSString *t) {
     dispatch_source_t _clipTimer;
     IOSPYH264Encoder *_encoder;    // created lazily on the capture queue
     uint8_t _codec;                // 0 = MJPEG, 1 = H.264 (host's request)
+    CGFloat _maxDimension;
+    CGFloat _quality;
+    NSTimeInterval _interval;
     BOOL _needKeyframe;            // force an H.264 keyframe on the next frame
 }
 
@@ -66,6 +100,9 @@ static uint64_t clipHash(NSString *t) {
 - (instancetype)init {
     if ((self = [super init])) {
         _fd = -1;
+        _maxDimension = kDefaultMaxDimension;
+        _quality = kDefaultQuality;
+        _interval = kDefaultInterval;
         _captureQueue = dispatch_queue_create("com.ioscpy.capture", DISPATCH_QUEUE_SERIAL);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
         [self startClipboardObserver];
@@ -204,12 +241,22 @@ static uint64_t clipHash(NSString *t) {
             continue;
         }
         if (header.type == IOSPYMsgStartStream) {
-            // The start command carries the codec the host wants (0/empty = MJPEG,
-            // 1 = H.264). Force a keyframe so a freshly connected host can decode.
-            uint8_t codec = (payload.length >= 1) ? ((const uint8_t *)payload.bytes)[0] : 0;
+            // START_STREAM: byte 0 selects codec. Newer hosts may append capture
+            // knobs: maxDimension u16, fps u8, JPEG quality percent u8. Missing or
+            // zero values keep the legacy defaults for backward compatibility.
+            const uint8_t *bytes = (const uint8_t *)payload.bytes;
+            uint8_t codec = (payload.length >= 1) ? bytes[0] : 0;
+            uint16_t maxDim = (payload.length >= 3) ? readBE16(bytes + 1) : 0;
+            uint8_t fps = (payload.length >= 4) ? bytes[3] : 0;
+            uint8_t quality = (payload.length >= 5) ? bytes[4] : 0;
             dispatch_async(_captureQueue, ^{
                 self->_codec = codec;
+                self->_maxDimension = streamMaxDimension(maxDim);
+                self->_interval = streamInterval(fps);
+                self->_quality = streamQuality(quality);
                 self->_needKeyframe = YES;
+                NSLog(@"[ioscpyhook] stream profile codec=%u max=%.0f fps=%.1f quality=%.2f",
+                      codec, self->_maxDimension, 1.0 / self->_interval, self->_quality);
                 [self startCapture];
             });
         } else if (header.type == IOSPYMsgStopStream) {
@@ -274,7 +321,10 @@ static uint64_t clipHash(NSString *t) {
         return;
     }
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _captureQueue);
-    uint64_t interval = (uint64_t)(kInterval * NSEC_PER_SEC);
+    uint64_t interval = (uint64_t)(_interval * NSEC_PER_SEC);
+    if (interval == 0) {
+        interval = (uint64_t)(kDefaultInterval * NSEC_PER_SEC);
+    }
     dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, interval, interval / 4);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{ [weakSelf captureAndSend]; });
@@ -338,7 +388,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
 
 - (void)captureAndSendJPEG:(int)fd {
     int width = 0, height = 0;
-    NSData *jpeg = IOSPYCaptureScreenJPEG(kMaxDimension, kQuality, &width, &height, NULL, NULL);
+    NSData *jpeg = IOSPYCaptureScreenJPEG(_maxDimension, _quality, &width, &height, NULL, NULL);
     if (!jpeg) {
         return;
     }
@@ -354,11 +404,11 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         _encoder = [[IOSPYH264Encoder alloc] init];
     }
     int width = 0, height = 0;
-    IOSurfaceRef surface = IOSPYCaptureScreenSurface(kMaxDimension, &width, &height);
+    IOSurfaceRef surface = IOSPYCaptureScreenSurface(_maxDimension, &width, &height);
     if (!surface || width < 2 || height < 2) {
         return NO;
     }
-    int fps = (int)round(1.0 / kInterval);
+    int fps = (int)round(1.0 / _interval);
     if (fps < 1) {
         fps = 1;
     }
