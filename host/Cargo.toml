@@ -31,6 +31,11 @@ objc = "0.2"
 block = "0.1"
 cocoa = "0.25"
 
+# Host clipboard on Linux/Windows (macOS uses NSPasteboard directly). Text only,
+# so image-data is dropped; wayland-data-control adds Wayland alongside X11.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"
 

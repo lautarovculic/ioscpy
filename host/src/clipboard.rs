@@ -100,15 +100,49 @@ pub const MAX_CLIPBOARD_BYTES: usize = 1 << 20;
 #[cfg(target_os = "macos")]
 pub use platform::{change_count, read_text, write_text};
 
+/// Linux/Windows clipboard via `arboard`. The handle is kept alive for the whole
+/// process: on Wayland/X11 we must keep owning the selection while it's ours.
+/// arboard has no change counter like NSPasteboard, so we derive one from the
+/// content hash: a real edit flips it, and our own writes (same hash) don't echo
+/// back to the device. The anti-echo relies on `arboard` round-tripping text
+/// unchanged (true for plain UTF-8); `change_count` is not a cheap counter here,
+/// it reads the clipboard, so the caller's poll interval should stay coarse.
 #[cfg(not(target_os = "macos"))]
-pub fn change_count() -> i64 {
-    0
+mod platform {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::hash_text;
+
+    fn clipboard() -> Option<&'static Mutex<arboard::Clipboard>> {
+        static CLIP: OnceLock<Option<Mutex<arboard::Clipboard>>> = OnceLock::new();
+        CLIP.get_or_init(|| arboard::Clipboard::new().ok().map(Mutex::new))
+            .as_ref()
+    }
+
+    pub fn read_text() -> Option<String> {
+        let mut clip = clipboard()?.lock().ok()?;
+        match clip.get_text() {
+            Ok(text) if !text.is_empty() => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn write_text(text: &str) -> i64 {
+        if let Some(clip) = clipboard() {
+            if let Ok(mut clip) = clip.lock() {
+                let _ = clip.set_text(text.to_owned());
+            }
+        }
+        hash_text(text) as i64
+    }
+
+    pub fn change_count() -> i64 {
+        match read_text() {
+            Some(text) => hash_text(&text) as i64,
+            None => 0,
+        }
+    }
 }
+
 #[cfg(not(target_os = "macos"))]
-pub fn read_text() -> Option<String> {
-    None
-}
-#[cfg(not(target_os = "macos"))]
-pub fn write_text(_text: &str) -> i64 {
-    0
-}
+pub use platform::{change_count, read_text, write_text};

@@ -228,6 +228,123 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
 #[cfg(not(target_os = "macos"))]
 fn install_key_monitor(_tx: Sender<InputFrame>, _clip: Arc<Mutex<ClipState>>) {}
 
+/// Forwards typed characters from minifb's input callback to the device as text.
+/// It tracks Ctrl from the same key-event stream (via `set_key_state`) and drops
+/// characters while Ctrl is held, so a shortcut like Ctrl+C isn't also typed. This
+/// is needed because minifb's backends disagree: X11 hands us a C0 control code for
+/// Ctrl+letter (caught by `is_control`), but Wayland resolves the bare keysym and
+/// hands us the plain letter, which `is_control` wouldn't catch.
+#[cfg(not(target_os = "macos"))]
+struct TextForwarder {
+    tx: Sender<InputFrame>,
+    ctrl: bool,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl minifb::InputCallback for TextForwarder {
+    fn add_char(&mut self, uni_char: u32) {
+        if self.ctrl {
+            return;
+        }
+        if let Some(c) = char::from_u32(uni_char) {
+            if !c.is_control() {
+                let _ = self
+                    .tx
+                    .send(InputFrame::new(MessageType::InputText, protocol::encode_text(&c.to_string())));
+            }
+        }
+    }
+
+    fn set_key_state(&mut self, key: minifb::Key, state: bool) {
+        if matches!(key, minifb::Key::LeftCtrl | minifb::Key::RightCtrl) {
+            self.ctrl = state;
+        }
+    }
+}
+
+/// Register text-input forwarding on the window. minifb's callback is per-window,
+/// so this must run again after the window is recreated on rotation. macOS uses
+/// the global `install_key_monitor` instead, so there it's a no-op.
+#[cfg(not(target_os = "macos"))]
+fn attach_text_input(window: &mut Window, tx: &Sender<InputFrame>) {
+    window.set_input_callback(Box::new(TextForwarder {
+        tx: tx.clone(),
+        ctrl: false,
+    }));
+}
+
+#[cfg(target_os = "macos")]
+fn attach_text_input(_window: &mut Window, _tx: &Sender<InputFrame>) {}
+
+/// Poll this frame's keys and forward shortcuts and editing keys, mirroring the
+/// macOS monitor but with Ctrl as the modifier (macOS uses Cmd). Text itself goes
+/// through `TextForwarder`; here we handle Esc (back), Enter/Tab, the repeating
+/// Backspace/arrows, and the Ctrl combos. macOS routes all of this through
+/// `install_key_monitor`, so this is Linux/Windows only.
+#[cfg(not(target_os = "macos"))]
+fn pump_keys(window: &Window, tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
+    use crate::protocol::KeyCode;
+    use minifb::{Key, KeyRepeat};
+
+    let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+
+    // One-shot keys: shortcuts and the editing keys that shouldn't auto-repeat.
+    for key in window.get_keys_pressed(KeyRepeat::No) {
+        if ctrl {
+            match key {
+                Key::J => send_action(tx, SystemAction::Home),
+                Key::L => send_action(tx, SystemAction::Lock),
+                Key::T => send_action(tx, SystemAction::AppSwitcher),
+                Key::R => send_action(tx, SystemAction::RotateLeft),
+                Key::A => send_key(tx, KeyCode::SelectAll),
+                Key::C => send_key(tx, KeyCode::Copy),
+                Key::V => {
+                    // Push the host clipboard to the device then paste, so a
+                    // cross-device paste works. Falls back to a plain iOS paste if
+                    // the host clipboard isn't usable text (empty, or no display).
+                    match clipboard::read_text() {
+                        Some(text)
+                            if !text.is_empty() && text.len() <= clipboard::MAX_CLIPBOARD_BYTES =>
+                        {
+                            if let Ok(mut st) = clip.lock() {
+                                st.last_synced_hash = Some(clipboard::hash_text(&text));
+                            }
+                            send_clipboard_set(tx, &text, true);
+                        }
+                        _ => send_key(tx, KeyCode::Paste),
+                    }
+                }
+                Key::X => send_key(tx, KeyCode::Cut),
+                Key::Z => send_key(tx, KeyCode::Undo),
+                _ => {}
+            }
+        } else {
+            match key {
+                Key::Escape => send_action(tx, SystemAction::Back),
+                Key::Enter | Key::NumPadEnter => send_key(tx, KeyCode::Enter),
+                Key::Tab => send_key(tx, KeyCode::Tab),
+                _ => {}
+            }
+        }
+    }
+
+    // Repeating keys: held Backspace and arrows keep firing. On a key's first frame
+    // it shows up in both KeyRepeat::No and ::Yes, so these keys must stay out of the
+    // one-shot match above, or they'd fire twice that frame. Keep the two sets disjoint.
+    if !ctrl {
+        for key in window.get_keys_pressed(KeyRepeat::Yes) {
+            match key {
+                Key::Backspace => send_key(tx, KeyCode::Backspace),
+                Key::Left => send_key(tx, KeyCode::Left),
+                Key::Right => send_key(tx, KeyCode::Right),
+                Key::Up => send_key(tx, KeyCode::Up),
+                Key::Down => send_key(tx, KeyCode::Down),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Window size for a `w`x`h` device frame at the given scale, clamped to at most
 /// about 92% of the screen while keeping the aspect ratio.
 fn scaled_fit(w: usize, h: usize, scale: f32) -> (usize, usize) {
@@ -253,9 +370,9 @@ fn open_window(title: &str, w: usize, h: usize) -> Result<Window> {
         h,
         WindowOptions {
             resize: true,
-            // We hand minifb a device-aspect, bilinear-scaled buffer, and
-            // AspectRatioStretch letterboxes it so it never distorts on resize.
-            scale_mode: ScaleMode::AspectRatioStretch,
+            // The buffer we present is already window-sized and letterboxed (see
+            // `scale_frame`), so Stretch blits it 1:1.
+            scale_mode: ScaleMode::Stretch,
             ..WindowOptions::default()
         },
     )
@@ -346,21 +463,28 @@ fn screen_visible_size() -> (f64, f64) {
     (1440.0, 900.0)
 }
 
-/// Bilinearly scale `src` into `dst`, keeping the device aspect ratio and fitting
-/// within `max_w`x`max_h`. Returns the produced dimensions. The buffer is always
-/// the device's aspect (never the window's), so AspectRatioStretch letterboxes it
-/// and it can't distort whatever shape the window is.
+/// Bilinearly scale `src` into a full `out_w`x`out_h` buffer, keeping the device
+/// aspect ratio and centering it with black bars (letterbox). Returns `(out_w,
+/// out_h)`. The buffer is window-sized so the caller can blit it 1:1 with
+/// `Stretch`: minifb's `AspectRatioStretch` can't do the letterboxing for us, as
+/// its POSIX scaler shears the image when the buffer is taller than the window
+/// (it swaps width/height into `image_resize_linear_stride`).
 fn scale_frame(
     src: &DecodedFrame,
-    max_w: usize,
-    max_h: usize,
+    out_w: usize,
+    out_h: usize,
     dst: &mut Vec<u32>,
 ) -> (usize, usize) {
-    let scale = (max_w as f32 / src.width as f32).min(max_h as f32 / src.height as f32);
-    let dw = ((src.width as f32 * scale) as usize).clamp(1, max_w.max(1));
-    let dh = ((src.height as f32 * scale) as usize).clamp(1, max_h.max(1));
+    let out_w = out_w.max(1);
+    let out_h = out_h.max(1);
     dst.clear();
-    dst.resize(dw * dh, 0);
+    dst.resize(out_w * out_h, 0);
+
+    let scale = (out_w as f32 / src.width as f32).min(out_h as f32 / src.height as f32);
+    let dw = ((src.width as f32 * scale) as usize).clamp(1, out_w);
+    let dh = ((src.height as f32 * scale) as usize).clamp(1, out_h);
+    let x_off = (out_w - dw) / 2;
+    let y_off = (out_h - dh) / 2;
 
     let inv_x = src.width as f32 / dw as f32;
     let inv_y = src.height as f32 / dh as f32;
@@ -373,7 +497,7 @@ fn scale_frame(
         let wy = fy - y0 as f32;
         let srow0 = y0 * src.width;
         let srow1 = y1 * src.width;
-        let drow = y * dw;
+        let drow = (y + y_off) * out_w + x_off;
         for x in 0..dw {
             let fx = ((x as f32 + 0.5) * inv_x - 0.5).max(0.0);
             let x0 = (fx as usize).min(last_x);
@@ -389,7 +513,7 @@ fn scale_frame(
             );
         }
     }
-    (dw, dh)
+    (out_w, out_h)
 }
 
 /// Bilinear blend of four `0x00RRGGBB` pixels.
@@ -438,6 +562,7 @@ pub fn run_window(
     let mut window = open_window(title, win_w, win_h)?;
     let clip = Arc::new(Mutex::new(ClipState::default()));
     install_key_monitor(input_tx.clone(), clip.clone());
+    attach_text_input(&mut window, &input_tx);
 
     let mut current = first;
     let mut last_dims = (current.width, current.height);
@@ -459,22 +584,24 @@ pub fn run_window(
             let pos = window.get_position();
             if let Ok(mut w) = open_window(title, nw, nh) {
                 w.set_position(pos.0, pos.1);
+                attach_text_input(&mut w, &input_tx);
                 window = w;
             }
         }
 
         pump_input(&window, &current, &mut input, &input_tx);
+        #[cfg(not(target_os = "macos"))]
+        pump_keys(&window, &input_tx, &clip);
 
-        // Bilinear-scale the frame to the window's backing (retina) resolution,
-        // keeping the device aspect. minifb's own scaler is nearest-neighbor, so
-        // matching backing pixels keeps it sharp, and AspectRatioStretch just
-        // letterboxes our device-aspect buffer so it never distorts. Capped so a
-        // huge window can't blow up the per-frame resize cost.
+        // Render a window-sized, letterboxed buffer at the backing (retina)
+        // resolution for minifb to blit 1:1. Both axes are capped together so a
+        // huge window keeps its aspect (and per-frame cost bounded) under Stretch.
         let (gw, gh) = window.get_size();
         let bs = backing_scale(&window);
-        let max_w = (((gw as f32 * bs) as usize).max(1)).min(2600);
-        let max_h = (((gh as f32 * bs) as usize).max(1)).min(2600);
-        let (bw, bh) = scale_frame(&current, max_w, max_h, &mut scaled);
+        let ow = (gw as f32 * bs).max(1.0);
+        let oh = (gh as f32 * bs).max(1.0);
+        let down = (2600.0 / ow).min(2600.0 / oh).min(1.0);
+        let (bw, bh) = scale_frame(&current, (ow * down) as usize, (oh * down) as usize, &mut scaled);
 
         window
             .update_with_buffer(&scaled, bw, bh)
