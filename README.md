@@ -123,6 +123,7 @@ and `dpkg-deb`.
 
 ioscpy is for controlling your own jailbroken iPhone from your Mac and Linux (Debian) device, over the USB
 cable, on the same desk.
+
 For Linux hosts, same external requirement as macOS: libimobiledevice tools (`iproxy`,
   `idevice_id`, `ideviceinfo`) and `usbmuxd`.
 
