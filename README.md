@@ -1,6 +1,6 @@
 # ioscpy
 
-A macOS CLI that mirrors and controls a jailbroken iPhone over USB.
+A macOS (now Linux!) CLI that mirrors and controls a jailbroken iPhone over USB.
 
 With one device attached, that is all you need. It connects on its own.
 
@@ -61,7 +61,20 @@ ioscpy --version
 
 Rotating the phone rotates and resizes the mirror.
 
-## Tested devices
+## Linux
+
+## Tested on
+Host: Debian, KDE/Wayland.
+
+Device:
+
+| layout | device | iOS | injection |
+| --- | --- | --- | --- |
+| roothide | iPhone11,2 | 15.5 | ElleKit |
+
+## macOS
+
+## Tested on
 
 ioscpy is developed and tested on the device below. I don't have a rootful device
 or other iOS versions on hand, so this table is incomplete.
@@ -112,6 +125,7 @@ ioscpy is for controlling your own jailbroken iPhone from your Mac, over the USB
 cable, on the same desk. It runs on macOS and talks to a jailbroken iOS device.
 It is not for Linux or Windows, and not for iPhones that are not jailbroken.
 
-## Author
+## Author / Contributors
 
-[Lautaro Villarreal Culic'](https://lautarovculic.com) - MIT licensed.
+- [Lautaro Villarreal Culic'](https://lautarovculic.com)
+- [Alessio Amatucci](https://github.com/Alexius22)
