@@ -121,9 +121,12 @@ and `dpkg-deb`.
 
 ## Scope
 
-ioscpy is for controlling your own jailbroken iPhone from your Mac, over the USB
-cable, on the same desk. It runs on macOS and talks to a jailbroken iOS device.
-It is not for Linux or Windows, and not for iPhones that are not jailbroken.
+ioscpy is for controlling your own jailbroken iPhone from your Mac and Linux (Debian) device, over the USB
+cable, on the same desk.
+For Linux hosts, same external requirement as macOS: libimobiledevice tools (`iproxy`,
+  `idevice_id`, `ideviceinfo`) and `usbmuxd`.
+
+It is not for Windows, and not for iPhones that are not jailbroken.
 
 ## Author / Contributors
 
