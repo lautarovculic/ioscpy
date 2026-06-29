@@ -33,8 +33,11 @@ cocoa = "0.25"
 
 # Host clipboard on Linux/Windows (macOS uses NSPasteboard directly). Text only,
 # so image-data is dropped; wayland-data-control adds Wayland alongside X11.
+# openh264 is the software H.264 decoder used off macOS, since the VideoToolbox
+# shim in h264_decoder.m is mac-only.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+openh264 = "0.9"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"
