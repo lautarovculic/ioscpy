@@ -63,14 +63,53 @@ Rotating the phone rotates and resizes the mirror.
 
 ## Linux
 
+There is no prebuilt for Linux yet. Build the host from source. The device
+package is the same as on macOS, installed from the Sileo/Zebra repo above.
+
+Prereqs on Debian/Ubuntu:
+
+```bash
+sudo apt install build-essential pkg-config nasm \
+                 libimobiledevice-utils usbmuxd \
+                 libxkbcommon-dev libwayland-dev \
+                 libxcb1-dev libxkbcommon-x11-dev
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Make sure `usbmuxd` is running so the device shows up:
+
+```bash
+sudo systemctl enable --now usbmuxd
+idevice_id -l   # should print the UDID with the phone attached
+```
+
+Build the host as your user, then install:
+
+```bash
+make host-release
+sudo make install-host    # installs to /usr/local/bin/ioscpy
+ioscpy --version
+```
+
+The build step stays as your user so a rustup-installed `cargo` is found.
+`install-host` is a separate target that just copies the built binary, so it
+runs fine under `sudo` without needing `cargo` on root's PATH. For a no-sudo
+install in your home, use `make install-host PREFIX=$HOME/.local` and make
+sure `$HOME/.local/bin` is on your `PATH`.
+
+H.264 decoding works on Linux through the `openh264` software decoder. Pass
+`--mjpeg` if you prefer the MJPEG path.
+
 ## Tested on
-Host: Debian, KDE/Wayland.
+
+Hosts: Debian, KDE/Wayland; Ubuntu 26.04, GNOME/Wayland.
 
 Device:
 
 | layout | device | iOS | injection |
 | --- | --- | --- | --- |
 | roothide | iPhone11,2 | 15.5 | ElleKit |
+| roothide | iPhone10,4 | 16.7.12 | ElleKit |
 
 ## macOS
 
