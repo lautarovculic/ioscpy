@@ -6,8 +6,8 @@
 //!
 //! Icons are PNGs under `assets/icons/`, traced from the Lucide icon set
 //! (https://lucide.dev, ISC license), embedded with `include_bytes!` and
-//! decoded once at startup. To change an icon, replace its PNG and rebuild —
-//! nothing else in this file needs to change.
+//! decoded once, lazily, on first draw (see `icon_for`). To change an icon,
+//! replace its PNG and rebuild — nothing else in this file needs to change.
 
 use std::io::Cursor;
 use std::sync::OnceLock;
