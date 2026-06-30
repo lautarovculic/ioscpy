@@ -16,6 +16,7 @@ mod keyboard;
 mod logging;
 mod mouse;
 mod protocol;
+mod sidebar;
 mod update;
 mod usbmux;
 mod video;
