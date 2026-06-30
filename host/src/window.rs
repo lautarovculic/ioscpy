@@ -15,7 +15,8 @@ use minifb::{MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 
 use crate::clipboard;
 use crate::input::{map_to_norm, InputFrame};
-use crate::protocol::{self, MessageType, SystemAction, TouchPhase};
+use crate::protocol::{self, KeyCode, MessageType, SystemAction, TouchPhase};
+use crate::sidebar;
 use crate::video::DecodedFrame;
 
 /// Where the network thread drops the most recent decoded frame (latest only).
@@ -54,6 +55,40 @@ fn send_clipboard_set(tx: &Sender<InputFrame>, text: &str, paste: bool) {
     p.push(if paste { 0x01 } else { 0x00 });
     p.extend_from_slice(text.as_bytes());
     let _ = tx.send(InputFrame::new(MessageType::ClipboardSet, p));
+}
+
+/// Push the host clipboard to the device then paste it, so cross-device paste
+/// carries the right text. Falls back to a plain iOS paste if the host
+/// clipboard isn't usable text (empty, too large, or no display). Shared by
+/// the Cmd/Ctrl+V shortcut and the sidebar Paste button.
+fn paste_now(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
+    match clipboard::read_text() {
+        Some(text) if !text.is_empty() && text.len() <= clipboard::MAX_CLIPBOARD_BYTES => {
+            if let Ok(mut st) = clip.lock() {
+                st.last_synced_hash = Some(clipboard::hash_text(&text));
+            }
+            send_clipboard_set(tx, &text, true);
+        }
+        _ => send_key(tx, KeyCode::Paste),
+    }
+}
+
+/// Translate a sidebar button press into the same messages its matching
+/// keyboard shortcut sends.
+fn dispatch_sidebar_action(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>, action: sidebar::Action) {
+    use sidebar::Action::*;
+    match action {
+        Home => send_action(tx, SystemAction::Home),
+        Lock => send_action(tx, SystemAction::Lock),
+        AppSwitcher => send_action(tx, SystemAction::AppSwitcher),
+        Rotate => send_action(tx, SystemAction::RotateLeft),
+        Back => send_action(tx, SystemAction::Back),
+        SelectAll => send_key(tx, KeyCode::SelectAll),
+        Copy => send_key(tx, KeyCode::Copy),
+        Paste => paste_now(tx, clip),
+        Cut => send_key(tx, KeyCode::Cut),
+        Undo => send_key(tx, KeyCode::Undo),
+    }
 }
 
 /// Put a clipboard value the device sent into the Mac pasteboard, recording the
@@ -117,7 +152,6 @@ unsafe fn nsstring_to_string(ns: *mut objc::runtime::Object) -> String {
 /// keyboard layout already gave us the right glyph). Handled events are swallowed.
 #[cfg(target_os = "macos")]
 fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
-    use crate::protocol::KeyCode;
     use block::ConcreteBlock;
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
@@ -151,23 +185,7 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
                         b'r' | b'R' => send_action(&tx, SystemAction::RotateLeft),
                         b'a' | b'A' => send_key(&tx, KeyCode::SelectAll),
                         b'c' | b'C' => send_key(&tx, KeyCode::Copy),
-                        b'v' | b'V' => {
-                            // Push the Mac clipboard to the device then paste it, so
-                            // cross-device paste works. Falls back to a plain iOS
-                            // paste if the Mac clipboard isn't usable text.
-                            match clipboard::read_text() {
-                                Some(text)
-                                    if !text.is_empty()
-                                        && text.len() <= clipboard::MAX_CLIPBOARD_BYTES =>
-                                {
-                                    if let Ok(mut st) = clip.lock() {
-                                        st.last_synced_hash = Some(clipboard::hash_text(&text));
-                                    }
-                                    send_clipboard_set(&tx, &text, true);
-                                }
-                                _ => send_key(&tx, KeyCode::Paste),
-                            }
-                        }
+                        b'v' | b'V' => paste_now(&tx, &clip),
                         b'x' | b'X' => send_key(&tx, KeyCode::Cut),
                         b'z' | b'Z' => send_key(&tx, KeyCode::Undo),
                         _ => handled = false,
@@ -283,7 +301,6 @@ fn attach_text_input(_window: &mut Window, _tx: &Sender<InputFrame>) {}
 /// `install_key_monitor`, so this is Linux/Windows only.
 #[cfg(not(target_os = "macos"))]
 fn pump_keys(window: &Window, tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
-    use crate::protocol::KeyCode;
     use minifb::{Key, KeyRepeat};
 
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
@@ -298,22 +315,7 @@ fn pump_keys(window: &Window, tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipStat
                 Key::R => send_action(tx, SystemAction::RotateLeft),
                 Key::A => send_key(tx, KeyCode::SelectAll),
                 Key::C => send_key(tx, KeyCode::Copy),
-                Key::V => {
-                    // Push the host clipboard to the device then paste, so a
-                    // cross-device paste works. Falls back to a plain iOS paste if
-                    // the host clipboard isn't usable text (empty, or no display).
-                    match clipboard::read_text() {
-                        Some(text)
-                            if !text.is_empty() && text.len() <= clipboard::MAX_CLIPBOARD_BYTES =>
-                        {
-                            if let Ok(mut st) = clip.lock() {
-                                st.last_synced_hash = Some(clipboard::hash_text(&text));
-                            }
-                            send_clipboard_set(tx, &text, true);
-                        }
-                        _ => send_key(tx, KeyCode::Paste),
-                    }
-                }
+                Key::V => paste_now(tx, clip),
                 Key::X => send_key(tx, KeyCode::Cut),
                 Key::Z => send_key(tx, KeyCode::Undo),
                 _ => {}
@@ -346,15 +348,20 @@ fn pump_keys(window: &Window, tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipStat
 }
 
 /// Window size for a `w`x`h` device frame at the given scale, clamped to at most
-/// about 92% of the screen while keeping the aspect ratio.
-fn scaled_fit(w: usize, h: usize, scale: f32) -> (usize, usize) {
+/// about 92% of the screen while keeping the aspect ratio. `sidebar_w` is a
+/// fixed-width budget (the button panel) added on top of the scaled content,
+/// not stretched with it; the returned width includes it.
+fn scaled_fit(w: usize, h: usize, scale: f32, sidebar_w: usize) -> (usize, usize) {
     let (sw, sh) = screen_visible_size();
-    let (max_w, max_h) = ((sw * 0.92) as f32, (sh * 0.92) as f32);
+    let (max_w, max_h) = (
+        ((sw * 0.92) as f32 - sidebar_w as f32).max(160.0),
+        (sh * 0.92) as f32,
+    );
     let tw = w as f32 * scale;
     let th = h as f32 * scale;
     let clamp = (max_w / tw).min(max_h / th).min(1.0);
     (
-        ((tw * clamp) as usize).max(160),
+        ((tw * clamp) as usize).max(160) + sidebar_w,
         ((th * clamp) as usize).max(160),
     )
 }
@@ -463,27 +470,22 @@ fn screen_visible_size() -> (f64, f64) {
     (1440.0, 900.0)
 }
 
-/// Bilinearly scale `src` into a full `out_w`x`out_h` buffer, keeping the device
-/// aspect ratio and centering it with black bars (letterbox). Returns `(out_w,
-/// out_h)`. The buffer is window-sized so the caller can blit it 1:1 with
-/// `Stretch`: minifb's `AspectRatioStretch` can't do the letterboxing for us, as
-/// its POSIX scaler shears the image when the buffer is taller than the window
-/// (it swaps width/height into `image_resize_linear_stride`).
-fn scale_frame(
-    src: &DecodedFrame,
-    out_w: usize,
-    out_h: usize,
-    dst: &mut Vec<u32>,
-) -> (usize, usize) {
-    let out_w = out_w.max(1);
+/// Bilinearly scale `src` into the `[0, content_w)` columns of `dst`, a
+/// `stride`-wide by `out_h`-tall buffer that also holds the sidebar past
+/// `content_w`. Keeps the device aspect ratio and centers it with black bars
+/// (letterbox) within that column range; `dst` must already be cleared to the
+/// letterbox color. minifb's `AspectRatioStretch` can't do this letterboxing
+/// for us, as its POSIX scaler shears the image when the buffer is taller
+/// than the window (it swaps width/height into `image_resize_linear_stride`),
+/// so we letterbox ourselves and blit the result 1:1 with `Stretch`.
+fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize, dst: &mut [u32]) {
+    let content_w = content_w.max(1);
     let out_h = out_h.max(1);
-    dst.clear();
-    dst.resize(out_w * out_h, 0);
 
-    let scale = (out_w as f32 / src.width as f32).min(out_h as f32 / src.height as f32);
-    let dw = ((src.width as f32 * scale) as usize).clamp(1, out_w);
+    let scale = (content_w as f32 / src.width as f32).min(out_h as f32 / src.height as f32);
+    let dw = ((src.width as f32 * scale) as usize).clamp(1, content_w);
     let dh = ((src.height as f32 * scale) as usize).clamp(1, out_h);
-    let x_off = (out_w - dw) / 2;
+    let x_off = (content_w - dw) / 2;
     let y_off = (out_h - dh) / 2;
 
     let inv_x = src.width as f32 / dw as f32;
@@ -497,7 +499,7 @@ fn scale_frame(
         let wy = fy - y0 as f32;
         let srow0 = y0 * src.width;
         let srow1 = y1 * src.width;
-        let drow = (y + y_off) * out_w + x_off;
+        let drow = (y + y_off) * stride + x_off;
         for x in 0..dw {
             let fx = ((x as f32 + 0.5) * inv_x - 0.5).max(0.0);
             let x0 = (fx as usize).min(last_x);
@@ -513,7 +515,6 @@ fn scale_frame(
             );
         }
     }
-    (out_w, out_h)
 }
 
 /// Bilinear blend of four `0x00RRGGBB` pixels.
@@ -558,7 +559,7 @@ pub fn run_window(
     let short = first.width.min(first.height).max(1) as f32;
     let display_scale = ((sh * 0.92) / long).min((sw * 0.92) / short);
     // Size the first window exactly as a rotation to this shape would.
-    let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale);
+    let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale, sidebar::WIDTH);
     let mut window = open_window(title, win_w, win_h)?;
     let clip = Arc::new(Mutex::new(ClipState::default()));
     install_key_monitor(input_tx.clone(), clip.clone());
@@ -567,7 +568,7 @@ pub fn run_window(
     let mut current = first;
     let mut last_dims = (current.width, current.height);
     let mut input = InputState::default();
-    let mut scaled: Vec<u32> = Vec::new();
+    let mut combined: Vec<u32> = Vec::new();
     let mut last_clip_poll = Instant::now();
     while window.is_open() && !stop.load(Ordering::Relaxed) {
         // Take the newest decoded frame, dropping any older one.
@@ -580,7 +581,7 @@ pub fn run_window(
         // recreating it is the reliable way to follow the rotation.
         if (current.width, current.height) != last_dims {
             last_dims = (current.width, current.height);
-            let (nw, nh) = scaled_fit(current.width, current.height, display_scale);
+            let (nw, nh) = scaled_fit(current.width, current.height, display_scale, sidebar::WIDTH);
             let pos = window.get_position();
             if let Ok(mut w) = open_window(title, nw, nh) {
                 w.set_position(pos.0, pos.1);
@@ -589,22 +590,38 @@ pub fn run_window(
             }
         }
 
-        pump_input(&window, &current, &mut input, &input_tx);
+        // Window points: the sidebar is a fixed-width strip on the right, the
+        // device frame and touch mapping get whatever's left.
+        let (gw, gh) = window.get_size();
+        let content_w = gw.saturating_sub(sidebar::WIDTH).max(1);
+
+        let input_ctx = InputCtx { content_w, win_h: gh, tx: &input_tx, clip: &clip };
+        pump_input(&window, &current, &mut input, &input_ctx);
         #[cfg(not(target_os = "macos"))]
         pump_keys(&window, &input_tx, &clip);
 
         // Render a window-sized, letterboxed buffer at the backing (retina)
         // resolution for minifb to blit 1:1. Both axes are capped together so a
         // huge window keeps its aspect (and per-frame cost bounded) under Stretch.
-        let (gw, gh) = window.get_size();
+        // Content and sidebar are written directly into one shared buffer, side
+        // by side, instead of composing separate buffers and copying them
+        // together every frame.
         let bs = backing_scale(&window);
-        let ow = (gw as f32 * bs).max(1.0);
+        let ow = (content_w as f32 * bs).max(1.0);
         let oh = (gh as f32 * bs).max(1.0);
-        let down = (2600.0 / ow).min(2600.0 / oh).min(1.0);
-        let (bw, bh) = scale_frame(&current, (ow * down) as usize, (oh * down) as usize, &mut scaled);
+        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs)).min(2600.0 / oh).min(1.0);
+        let content_px = ((ow * down) as usize).max(1);
+        let total_h = ((oh * down) as usize).max(1);
+        let sb_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
+        let stride = content_px + sb_px;
+
+        combined.clear();
+        combined.resize(stride * total_h, 0);
+        scale_frame(&current, content_px, total_h, stride, &mut combined);
+        sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
 
         window
-            .update_with_buffer(&scaled, bw, bh)
+            .update_with_buffer(&combined, stride, total_h)
             .context("failed to present a frame")?;
 
         // Push Mac clipboard changes to the device (rate-limited).
@@ -626,38 +643,75 @@ pub fn run_window(
 struct InputState {
     touching: bool,
     last: (f32, f32),
+    /// Index of the sidebar button the press started on, while still held.
+    sidebar_down: Option<usize>,
 }
 
-/// Turn this frame's mouse state into touch messages. Keyboard shortcuts are
+/// Per-frame input collaborators, bundled so `pump_input` and its helpers
+/// stay under the 4-parameter line instead of threading five separate
+/// references through each call.
+struct InputCtx<'a> {
+    /// Window points excluding the sidebar; touch coordinates are mapped
+    /// against this so the button panel never counts as part of the device
+    /// screen.
+    content_w: usize,
+    win_h: usize,
+    tx: &'a Sender<InputFrame>,
+    clip: &'a Arc<Mutex<ClipState>>,
+}
+
+/// Turn this frame's mouse state into touch messages, or, for a press that
+/// starts in the sidebar strip, a button action. Keyboard shortcuts are
 /// handled separately by the event monitor.
-fn pump_input(
-    window: &Window,
-    frame: &DecodedFrame,
-    state: &mut InputState,
-    tx: &Sender<InputFrame>,
-) {
-    let (ww, wh) = window.get_size();
+fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx: &InputCtx) {
     let down = window.get_mouse_down(MouseButton::Left);
 
-    if down {
-        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
-            let (nx, ny) = map_to_norm(mx, my, ww, wh, frame.width, frame.height);
-            if !state.touching {
-                send_touch(tx, TouchPhase::Down, nx, ny);
-                state.touching = true;
-            } else if (nx - state.last.0).abs() > 0.001 || (ny - state.last.1).abs() > 0.001 {
-                // Only emit a move when the position actually changes.
-                send_touch(tx, TouchPhase::Move, nx, ny);
-            }
-            state.last = (nx, ny);
+    if !down {
+        if state.touching {
+            // Button released: always lift, using the last known position, even if
+            // the cursor is now outside the window (a fast swipe can release out
+            // there). Skip this and a phantom finger stays down on the device,
+            // which then ignores every later touch until something resets it.
+            send_touch(ctx.tx, TouchPhase::Up, state.last.0, state.last.1);
+            state.touching = false;
         }
-    } else if state.touching {
-        // Button released: always lift, using the last known position, even if the
-        // cursor is now outside the window (a fast swipe can release out there).
-        // Skip this and a phantom finger stays down on the device, which then
-        // ignores every later touch until something resets it.
-        send_touch(tx, TouchPhase::Up, state.last.0, state.last.1);
-        state.touching = false;
+        state.sidebar_down = None;
+        return;
+    }
+
+    let Some(pos) = window.get_mouse_pos(MouseMode::Clamp) else {
+        return;
+    };
+
+    if state.touching {
+        let (nx, ny) = map_to_norm(pos.0, pos.1, ctx.content_w, ctx.win_h, frame.width, frame.height);
+        if (nx - state.last.0).abs() > 0.001 || (ny - state.last.1).abs() > 0.001 {
+            // Only emit a move when the position actually changes.
+            send_touch(ctx.tx, TouchPhase::Move, nx, ny);
+        }
+        state.last = (nx, ny);
+        return;
+    }
+
+    if state.sidebar_down.is_some() {
+        return; // press started on a button; ignore drag until release
+    }
+
+    handle_fresh_press(pos, frame, state, ctx);
+}
+
+/// A press that wasn't already tracked as a touch or a held button: route it
+/// to a touch-down or a sidebar button depending on where it landed.
+fn handle_fresh_press(pos: (f32, f32), frame: &DecodedFrame, state: &mut InputState, ctx: &InputCtx) {
+    let (mx, my) = pos;
+    if (mx as usize) < ctx.content_w {
+        let (nx, ny) = map_to_norm(mx, my, ctx.content_w, ctx.win_h, frame.width, frame.height);
+        send_touch(ctx.tx, TouchPhase::Down, nx, ny);
+        state.touching = true;
+        state.last = (nx, ny);
+    } else if let Some(idx) = sidebar::hit_test(mx - ctx.content_w as f32, my, ctx.win_h as f32) {
+        state.sidebar_down = Some(idx);
+        dispatch_sidebar_action(ctx.tx, ctx.clip, sidebar::BUTTONS[idx]);
     }
 }
 
