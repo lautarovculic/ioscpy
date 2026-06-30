@@ -23,7 +23,8 @@ install-host:
 	    echo "host/target/release/ioscpy missing; run 'make host-release' as your user first"; \
 	    exit 1; \
 	}
-	install -D -m 0755 host/target/release/ioscpy $(PREFIX)/bin/ioscpy
+	mkdir -p $(PREFIX)/bin
+	install -m 0755 host/target/release/ioscpy $(PREFIX)/bin/ioscpy
 	@echo "installed ioscpy -> $(PREFIX)/bin/ioscpy"
 
 uninstall-host:
