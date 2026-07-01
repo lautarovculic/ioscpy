@@ -23,14 +23,14 @@ is: tag the code, then update `url` and `sha256` to match.
 1. Tag and push the version in the main repo:
 
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.5
+   git push origin v0.1.5
    ```
 
 2. Get the hash of the tarball GitHub builds for that tag:
 
    ```bash
-   curl -fsSL https://github.com/lautarovculic/ioscpy/archive/refs/tags/v0.1.0.tar.gz \
+   curl -fsSL https://github.com/lautarovculic/ioscpy/archive/refs/tags/v0.1.5.tar.gz \
      | shasum -a 256
    ```
 

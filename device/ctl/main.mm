@@ -41,7 +41,7 @@ static NSDictionary *fetchHandshake(uint16_t port) {
     }
     NSDictionary *hello = @{
         @"role": @"ctl",
-        @"host_version": @"0.1.0",
+        @"host_version": @"0.1.5",
         @"protocol_version": @(IOSPY_PROTOCOL_VERSION),
         @"nonce": @"00",
     };

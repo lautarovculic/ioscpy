@@ -170,7 +170,7 @@ To prevent loops, each side records the FNV-1a/64 hash of the last value it sync
 ```json
 {
   "role": "host",
-  "host_version": "0.1.0",
+  "host_version": "0.1.5",
   "protocol_version": 4,
   "nonce": "<hex>"
 }
@@ -184,7 +184,7 @@ in an `AUTHENTICATE` frame before any privileged message is honored (see below).
 
 ```json
 {
-  "daemon_version": "0.1.0",
+  "daemon_version": "0.1.5",
   "protocol_version": 4,
   "session_token": "<hex>",
   "capabilities": {

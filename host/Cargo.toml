@@ -1,6 +1,6 @@
 [package]
 name = "ioscpy"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.74"
 description = "macOS CLI to mirror and control a jailbroken iPhone over USB"
