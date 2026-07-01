@@ -2,6 +2,7 @@
 
 ToDo:
 - [ ] New release `v0.1.5` for brew and Sileo/Zebra
+- [ ] Improve/Enchance `README.md`
 
 A macOS (now Linux!) CLI that mirrors and controls a jailbroken iPhone over USB.
 
