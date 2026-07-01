@@ -171,4 +171,5 @@ It is not for Windows, and not for iPhones that are not jailbroken.
 ## Author / Contributors
 
 - [Lautaro Villarreal Culic'](https://lautarovculic.com)
+- [Mu'men Yasser](https://www.linkedin.com/in/ymuu/)
 - [Alessio Amatucci](https://github.com/Alexius22)
