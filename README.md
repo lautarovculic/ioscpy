@@ -1,10 +1,6 @@
 # ioscpy
 
-ToDo:
-- [ ] New release `v0.1.5` for brew and Sileo/Zebra
-- [ ] Improve/Enchance `README.md`
-
-A macOS (now Linux!) CLI that mirrors and controls a jailbroken iPhone over USB.
+A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
 
 With one device attached, that is all you need. It connects on its own.
 
@@ -147,7 +143,7 @@ Hosts:
 - Ubuntu 26.04, GNOME/Wayland
 - Arch Linux, BSPWM
 
-Device:
+Devices:
 
 | layout | device | iOS | injection |
 | --- | --- | --- | --- |
@@ -155,18 +151,14 @@ Device:
 | roothide | iPhone10,4 | 16.7.12 | ElleKit |
 | roothide | iPhone10,3 | 16.7.10 | ElleKit |
 
-## macOS
+ioscpy is developed and tested on the devices above. I don't have a rootful device
+or every iOS version on hand, so coverage by layout is incomplete:
 
-## Tested on
-
-ioscpy is developed and tested on the device below. I don't have a rootful device
-or other iOS versions on hand, so this table is incomplete.
-
-| layout   | device     | iOS     | injection | status                                          |
-|----------|------------|---------|-----------|-------------------------------------------------|
-| rootless |            |         |           | scheme builds; runs on the roothide unit via `/var/jb` |
-| roothide | iPhone10,3 | 16.7.10 | ElleKit   | working (rootless `.deb` via `/var/jb`)         |
-| rootful  |            |         |           | builds and layout validated; runtime not tested |
+| layout   | status                                          |
+|----------|-------------------------------------------------|
+| rootless | builds; runs on the roothide unit via `/var/jb` |
+| roothide | working (rootless `.deb` via `/var/jb`)         |
+| rootful  | builds and layout validated; runtime not tested |
 
 If you run ioscpy on a different iPhone, iOS version, or jailbreak, please help fill
 this in. Rootful and other iOS versions especially need testing.
@@ -183,7 +175,7 @@ this in. Rootful and other iOS versions especially need testing.
 ## Layout
 
 ```text
-host/       Rust macOS CLI
+host/       Rust host CLI (macOS and Linux)
 device/     iOS package (Theos): daemon, ctl, tweak, jbcompat, packaging
 protocol/   wire format docs, kept in lockstep with the code
 scripts/    device deploy, respring, log, and diagnostics helpers

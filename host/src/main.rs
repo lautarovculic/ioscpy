@@ -154,7 +154,8 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
         net_stop.store(true, Ordering::Relaxed);
     });
 
-    let result = window::run_window(&banner, slot, stop.clone(), input_tx, clip_in_rx);
+    let window_title = format!("ioscpy v{HOST_VERSION}");
+    let result = window::run_window(&window_title, slot, stop.clone(), input_tx, clip_in_rx);
     stop.store(true, Ordering::Relaxed);
     let _ = net.join();
     result

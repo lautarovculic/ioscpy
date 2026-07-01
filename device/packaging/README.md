@@ -53,5 +53,5 @@ prefix and the injection framework instead of assuming them.
 | roothide | detected at runtime | iphoneos-arm64 | ElleKit              |
 
 All variants share the `iphoneos-arm64` architecture (the Procursus architecture
-used by modern iOS 14 and later jailbreaks). They differ only in the install
+used by modern iOS 15 and later jailbreaks). They differ only in the install
 prefix, which the install scripts and `jbcompat` resolve on the device.
