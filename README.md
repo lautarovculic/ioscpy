@@ -91,6 +91,42 @@ sudo make install-host    # installs to /usr/local/bin/ioscpy
 ioscpy --version
 ```
 
+## For Arch Linux
+
+```bash
+sudo pacman -S --needed \
+  base-devel pkgconf nasm \
+  libimobiledevice usbmuxd \
+  libxkbcommon wayland libxcb libxkbcommon-x11 \
+  rustup curl git
+```
+
+```bash
+rustup default stable
+```
+
+Enable the service
+
+```bash
+sudo systemctl enable --now usbmuxd.service
+```
+
+Check if device is connected
+
+```bash
+idevice_id -l
+```
+
+Then run the binary
+
+```bash
+cd host/target/release && chmod +x ioscpy
+```
+
+```bash
+./ioscpy
+```
+
 The build step stays as your user so a rustup-installed `cargo` is found.
 `install-host` is a separate target that just copies the built binary, so it
 runs fine under `sudo` without needing `cargo` on root's PATH. For a no-sudo
@@ -102,7 +138,10 @@ H.264 decoding works on Linux through the `openh264` software decoder. Pass
 
 ## Tested on
 
-Hosts: Debian, KDE/Wayland; Ubuntu 26.04, GNOME/Wayland.
+Hosts:
+- Debian, KDE/Wayland
+- Ubuntu 26.04, GNOME/Wayland
+- Arch Linux, BSPWM
 
 Device:
 
@@ -110,6 +149,7 @@ Device:
 | --- | --- | --- | --- |
 | roothide | iPhone11,2 | 15.5 | ElleKit |
 | roothide | iPhone10,4 | 16.7.12 | ElleKit |
+| roothide | iPhone10,3 | 16.7.10 | ElleKit |
 
 ## macOS
 
