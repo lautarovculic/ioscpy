@@ -1,5 +1,8 @@
 # ioscpy
 
+ToDo:
+- [ ] New release `v0.1.5` for brew and Sileo/Zebra
+
 A macOS (now Linux!) CLI that mirrors and controls a jailbroken iPhone over USB.
 
 With one device attached, that is all you need. It connects on its own.
