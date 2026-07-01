@@ -15,7 +15,15 @@ host:
 host-release:
 	cd host && cargo build --release
 
-install-host: host-release
+# No host-release dependency on purpose: this target is usually run with sudo,
+# and root's PATH does not see a rustup-installed cargo. Build as your user
+# first (`make host-release`), then install.
+install-host:
+	@test -x host/target/release/ioscpy || { \
+	    echo "host/target/release/ioscpy missing; run 'make host-release' as your user first"; \
+	    exit 1; \
+	}
+	mkdir -p $(PREFIX)/bin
 	install -m 0755 host/target/release/ioscpy $(PREFIX)/bin/ioscpy
 	@echo "installed ioscpy -> $(PREFIX)/bin/ioscpy"
 

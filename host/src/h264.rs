@@ -99,14 +99,70 @@ impl Drop for H264Decoder {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub struct H264Decoder;
+use openh264::{decoder::Decoder, formats::YUVSource};
+
+#[cfg(not(target_os = "macos"))]
+pub struct H264Decoder {
+    inner: Decoder,
+    // Reused between frames so the per-frame conversion is a copy, not an
+    // allocation.
+    annex_b: Vec<u8>,
+    rgb: Vec<u8>,
+}
+
+#[cfg(not(target_os = "macos"))]
+const H264_ANNEX_B_START: [u8; 4] = [0, 0, 0, 1];
+
+/// Convert one AVCC sample (4-byte big-endian length, then NAL, repeated) into
+/// the Annex-B form openh264 expects (start code, then NAL, repeated). Returns
+/// `false` if the lengths don't add up, which means a malformed frame.
+#[cfg(not(target_os = "macos"))]
+fn avcc_to_annex_b(avcc: &[u8], out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let mut i = 0;
+    while i + 4 <= avcc.len() {
+        let nal_len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
+        i += 4;
+        if nal_len == 0 || i + nal_len > avcc.len() {
+            return false;
+        }
+        out.extend_from_slice(&H264_ANNEX_B_START);
+        out.extend_from_slice(&avcc[i..i + nal_len]);
+        i += nal_len;
+    }
+    i == avcc.len()
+}
 
 #[cfg(not(target_os = "macos"))]
 impl H264Decoder {
     pub fn new() -> Option<Self> {
-        None
+        Decoder::new().ok().map(|inner| Self {
+            inner,
+            annex_b: Vec::new(),
+            rgb: Vec::new(),
+        })
     }
-    pub fn decode(&mut self, _avcc: &[u8]) -> Decoded {
-        Decoded::Failed
+
+    pub fn decode(&mut self, avcc: &[u8]) -> Decoded {
+        if !avcc_to_annex_b(avcc, &mut self.annex_b) {
+            return Decoded::Failed;
+        }
+        match self.inner.decode(&self.annex_b) {
+            Ok(Some(yuv)) => {
+                let (width, height) = yuv.dimensions();
+                let needed = width * height * 3;
+                if self.rgb.len() < needed {
+                    self.rgb.resize(needed, 0);
+                }
+                yuv.write_rgb8(&mut self.rgb[..needed]);
+                let buf = crate::video::pack_rgb888(&self.rgb, width, height);
+                Decoded::Frame(DecodedFrame { buf, width, height })
+            }
+            Ok(None) => Decoded::Pending,
+            Err(e) => {
+                crate::warn!("h264 decode error: {e}");
+                Decoded::Failed
+            }
+        }
     }
 }

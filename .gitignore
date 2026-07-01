@@ -33,3 +33,4 @@ id_rsa*
 *.token
 secrets.env
 .env
+docs/linux-h264.md

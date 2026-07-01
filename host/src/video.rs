@@ -73,8 +73,21 @@ pub fn rotate_cw(frame: DecodedFrame, turns: u8) -> DecodedFrame {
     }
 }
 
+/// Pack a tightly-packed RGB888 buffer into the window's `0x00RRGGBB` layout.
+/// `rgb.len()` must be at least `width * height * 3`; extra bytes are ignored.
+pub fn pack_rgb888(rgb: &[u8], width: usize, height: usize) -> Vec<u32> {
+    let mut buf = vec![0u32; width * height];
+    for (i, px) in buf.iter_mut().enumerate() {
+        let r = rgb[i * 3] as u32;
+        let g = rgb[i * 3 + 1] as u32;
+        let b = rgb[i * 3 + 2] as u32;
+        *px = (r << 16) | (g << 8) | b;
+    }
+    buf
+}
+
 /// Decode a JPEG into a packed 0RGB buffer. Returns `None` on a bad frame.
-/// Color JPEGs decode to RGB by default, which is what the packing below expects.
+/// Color JPEGs decode to RGB by default, which is what the packing expects.
 pub fn decode_jpeg(jpeg: &[u8]) -> Option<DecodedFrame> {
     let mut decoder = JpegDecoder::new(jpeg);
     let pixels = decoder.decode().ok()?;
@@ -84,12 +97,6 @@ pub fn decode_jpeg(jpeg: &[u8]) -> Option<DecodedFrame> {
         return None;
     }
 
-    let mut buf = vec![0u32; width * height];
-    for (i, px) in buf.iter_mut().enumerate() {
-        let r = pixels[i * 3] as u32;
-        let g = pixels[i * 3 + 1] as u32;
-        let b = pixels[i * 3 + 2] as u32;
-        *px = (r << 16) | (g << 8) | b;
-    }
+    let buf = pack_rgb888(&pixels, width, height);
     Some(DecodedFrame { buf, width, height })
 }
