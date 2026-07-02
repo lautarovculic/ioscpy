@@ -1,5 +1,8 @@
 # ioscpy
 
+## ToDo
+- [ ] Add Authentication & Authorization
+
 A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
 
 With one device attached, that is all you need. It connects on its own.
