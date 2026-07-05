@@ -22,8 +22,9 @@ mod usbmux;
 mod video;
 mod window;
 
-use std::net::TcpStream;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -561,7 +562,10 @@ fn reconnect_wait(stop: &Arc<AtomicBool>) -> bool {
 /// Diagnostics header for `--debug`.
 fn print_debug_header(cli: &Cli) {
     eprintln!("ioscpy {HOST_VERSION}");
+    #[cfg(target_os = "macos")]
     eprintln!("macOS  {}", macos_version());
+    #[cfg(target_os = "windows")]
+    eprintln!("Windows {}", windows_version());
     eprintln!(
         "target {}",
         cli.addr
@@ -571,9 +575,21 @@ fn print_debug_header(cli: &Cli) {
     );
 }
 
+#[cfg(target_os = "macos")]
 fn macos_version() -> String {
     Command::new("sw_vers")
         .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_version() -> String {
+    Command::new("cmd")
+        .args(["/c", "ver"])
         .output()
         .ok()
         .filter(|o| o.status.success())

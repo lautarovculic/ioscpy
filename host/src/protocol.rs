@@ -394,10 +394,20 @@ pub struct DaemonError {
 /// Short random hex string from the OS RNG. No crypto crate needed, the
 /// handshake nonce just has to be unique.
 pub fn random_hex(bytes: usize) -> String {
-    use std::fs::File;
     let mut buf = vec![0u8; bytes];
-    if let Ok(mut f) = File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
+    // macOS/Linux: read from /dev/urandom
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            let _ = f.read_exact(&mut buf);
+        }
+    }
+    // Windows: use BCryptGenRandom via getrandom crate, or a raw fallback
+    #[cfg(target_os = "windows")]
+    {
+        use getrandom::getrandom;
+        let _ = getrandom(&mut buf);
     }
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }

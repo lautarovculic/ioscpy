@@ -52,7 +52,16 @@ impl UsbForward {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .context("couldn't start the USB link. The USB tools are missing. Install them with:  brew install libimobiledevice")?;
+            .with_context(|| {
+                let hint = if cfg!(target_os = "macos") {
+                    "brew install libimobiledevice"
+                } else if cfg!(target_os = "windows") {
+                    "scoop install libimobiledevice"
+                } else {
+                    "apt install libimobiledevice-utils usbmuxd"
+                };
+                format!("couldn't start the USB link. The USB tools are missing. Install them with:  {hint}")
+            })?;
 
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {

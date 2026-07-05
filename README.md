@@ -8,7 +8,7 @@
 - [ ] Research: Make `ioscpy` wireless (BLE, Wi-Fi)
 - [ ] Custom Buttons Actions (Macros)
 
-A macOS and Linux CLI that mirrors and controls a jailbroken iPhone over USB.
+A macOS, Linux and Windows CLI that mirrors and controls a jailbroken iPhone over USB.
 
 With one device attached, that is all you need. It connects on its own.
 
@@ -99,6 +99,50 @@ sudo make install-host    # installs to /usr/local/bin/ioscpy
 ioscpy --version
 ```
 
+## Windows
+
+Build from source on Windows (MinGW64) or cross-compile from Linux/macOS.
+
+### Prerequisites (native Windows build)
+
+Install [Rust](https://rustup.rs) and add the MinGW64 target:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+```
+
+Install libimobiledevice via [Scoop](https://scoop.sh):
+
+```bash
+scoop install libimobiledevice
+```
+
+Or via MSYS2:
+
+```bash
+pacman -S mingw-w64-x86_64-libimobiledevice
+```
+
+### Build
+
+```bash
+cd host
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+The binary is at `host/target/x86_64-pc-windows-gnu/release/ioscpy.exe`.  
+Make sure `libimobiledevice` tools (`idevice_id`, `iproxy`) are on your `PATH`
+and the device is connected via USB.
+
+### Cross-compile from Linux/macOS
+
+```bash
+make host-release-windows
+```
+
+Requires `rustup target add x86_64-pc-windows-gnu` and a MinGW64 cross-compiler
+(e.g. `x86_64-w64-mingw32-gcc` from your distro's `mingw-w64` package).
+
 ## For Arch Linux
 
 ```bash
@@ -150,6 +194,7 @@ Hosts:
 - Debian, KDE/Wayland
 - Ubuntu 26.04, GNOME/Wayland
 - Arch Linux, BSPWM
+- Windows 11, MinGW64
 
 Devices:
 
@@ -184,7 +229,7 @@ this in. Rootful and other iOS versions especially need testing.
 ## Layout
 
 ```text
-host/       Rust host CLI (macOS and Linux)
+host/       Rust host CLI (macOS, Linux, and Windows)
 device/     iOS package (Theos): daemon, ctl, tweak, jbcompat, packaging
 protocol/   wire format docs, kept in lockstep with the code
 scripts/    device deploy, respring, log, and diagnostics helpers
@@ -194,10 +239,11 @@ docs/       architecture, jailbreak compatibility, troubleshooting, release
 ## Building
 
 ```bash
-make host-release        # macOS host binary
-make device-rootless     # rootless .deb (Dopamine, palera1n-rootless, /var/jb)
-make device-rootful      # rootful .deb (palera1n-rootful, /)
-make release             # host plus both device variants
+make host-release          # macOS/Linux host binary
+make host-release-windows  # cross-compile Windows binary (requires mingw-w64)
+make device-rootless       # rootless .deb (Dopamine, palera1n-rootless, /var/jb)
+make device-rootful        # rootful .deb (palera1n-rootful, /)
+make release               # host plus both device variants
 ```
 
 Requires Rust, Theos (`$THEOS`), libimobiledevice (`idevice_id`, `iproxy`), `ldid`,
@@ -205,10 +251,10 @@ and `dpkg-deb`.
 
 ## Scope
 
-ioscpy is for controlling your own jailbroken iPhone from your Mac and Linux (Debian, Ubuntu and Arch Linux) device, over the USB
+ioscpy is for controlling your own jailbroken iPhone from your Mac, Linux, or Windows device, over the USB
 cable, on the same desk.
 
-For Linux hosts, same external requirement as macOS: libimobiledevice tools (`iproxy`,
-  `idevice_id`, `ideviceinfo`) and `usbmuxd`.
+For Linux and Windows hosts, same external requirement as macOS: libimobiledevice tools (`iproxy`,
+  `idevice_id`, `ideviceinfo`) and (on Linux) `usbmuxd`.
 
-It is not for Windows, and not for iPhones that are not jailbroken.
+It is not for iPhones that are not jailbroken.

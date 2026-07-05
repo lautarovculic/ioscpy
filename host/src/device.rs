@@ -25,11 +25,18 @@ impl Device {
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<String> {
+    let install_hint = if cfg!(target_os = "macos") {
+        "brew install libimobiledevice"
+    } else if cfg!(target_os = "windows") {
+        "scoop install libimobiledevice  (or install via MSYS2: pacman -S mingw-w64-x86_64-libimobiledevice)"
+    } else {
+        "apt install libimobiledevice-utils usbmuxd  (or your distro's equivalent)"
+    };
     let out = Command::new(cmd)
         .args(args)
         .output()
         .with_context(|| {
-            format!("couldn't run `{cmd}`. The USB tools are missing. Install them with:  brew install libimobiledevice")
+            format!("couldn't run `{cmd}`. The USB tools are missing. Install them with:  {install_hint}")
         })?;
     if !out.status.success() {
         bail!(

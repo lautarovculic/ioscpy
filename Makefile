@@ -1,8 +1,8 @@
 # ioscpy top-level build orchestration.
 # Author: Lautaro Villarreal Culic' (https://lautarovculic.com)
 
-.PHONY: all host host-release install-host uninstall-host device device-rootless \
-        device-rootful device-roothide release repo clean fmt clippy test help
+.PHONY: all host host-release host-release-windows install-host uninstall-host \
+        device device-rootless device-rootful device-roothide release repo clean fmt clippy test help
 
 PREFIX ?= /usr/local
 
@@ -14,6 +14,9 @@ host:
 
 host-release:
 	cd host && cargo build --release
+
+host-release-windows:
+	cd host && cargo build --release --target x86_64-pc-windows-gnu
 
 # No host-release dependency on purpose: this target is usually run with sudo,
 # and root's PATH does not see a rustup-installed cargo. Build as your user
@@ -67,11 +70,12 @@ clean:
 
 help:
 	@echo "ioscpy targets:"
-	@echo "  make host-release      build macOS host binary (release)"
-	@echo "  make install-host      install ioscpy to $(PREFIX)/bin (on PATH)"
-	@echo "  make device-rootless   build rootless .deb (/var/jb)"
-	@echo "  make device-rootful    build rootful .deb (/)"
-	@echo "  make repo              build the Sileo/Zebra repo from the .deb"
-	@echo "  make release           host-release + both device variants"
-	@echo "  make fmt|clippy|test   host lint/test"
-	@echo "  make clean             clean host + device"
+	@echo "  make host-release        build macOS/Linux host binary (release)"
+	@echo "  make host-release-windows  build Windows host binary (needs MinGW64 + cross target)"
+	@echo "  make install-host        install ioscpy to $(PREFIX)/bin (on PATH)"
+	@echo "  make device-rootless     build rootless .deb (/var/jb)"
+	@echo "  make device-rootful      build rootful .deb (/)"
+	@echo "  make repo                build the Sileo/Zebra repo from the .deb"
+	@echo "  make release             host-release + both device variants"
+	@echo "  make fmt|clippy|test     host lint/test"
+	@echo "  make clean               clean host + device"

@@ -3,13 +3,13 @@ name = "ioscpy"
 version = "0.1.5"
 edition = "2021"
 rust-version = "1.74"
-description = "macOS CLI to mirror and control a jailbroken iPhone over USB"
+description = "Mirror and control a jailbroken iPhone over USB"
 authors = ["Lautaro Villarreal Culic' <lautaro@lautarovculic.com> (https://lautarovculic.com)"]
 license = "MIT"
 homepage = "https://lautarovculic.com"
 repository = "https://github.com/lautarovculic/ioscpy"
 readme = "../README.md"
-keywords = ["ios", "jailbreak", "mirroring", "usbmux", "macos"]
+keywords = ["ios", "jailbreak", "mirroring", "usbmux"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -38,8 +38,9 @@ cocoa = "0.25"
 # openh264 is the software H.264 decoder used off macOS, since the VideoToolbox
 # shim in h264_decoder.m is mac-only.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3", default-features = false }
 openh264 = "0.9"
+getrandom = "0.2"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"
