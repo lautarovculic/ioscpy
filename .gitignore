@@ -1,7 +1,11 @@
 # Rust / host
 host/target/
+host/vendor/
 **/*.rs.bk
 Cargo.lock.orig
+
+# Coding Tools execution metadata
+.baton/
 
 # Theos / device build artifacts
 device/.theos/
@@ -17,6 +21,8 @@ packaging/repo/out/
 
 # macOS
 .DS_Store
+macos/.build/
+dist/
 
 # Editor and local tooling state, not part of the project
 .vscode/

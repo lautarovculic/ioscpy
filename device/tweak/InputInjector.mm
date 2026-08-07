@@ -1,7 +1,10 @@
 #import "InputInjector.h"
+#import "DisplayController.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dlfcn.h>
+#import <mach/mach.h>
 #import <mach/mach_time.h>
 
 // Private IOKit HID SPI, not in the public headers, so declared here. Touches are
@@ -14,6 +17,8 @@ typedef uint32_t IOHIDEventField;
 typedef uint32_t IOOptionBits;
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+typedef struct __IOHIDEventSystemConnection *IOHIDEventSystemConnectionRef;
+typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
 
 extern "C" {
 IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator, uint64_t timeStamp,
@@ -34,6 +39,7 @@ void IOHIDEventSetIntegerValue(IOHIDEventRef e, IOHIDEventField f, int v);
 void IOHIDEventSetFloatValue(IOHIDEventRef e, IOHIDEventField f, IOHIDFloat v);
 void IOHIDEventSetSenderID(IOHIDEventRef e, uint64_t senderID);
 uint64_t IOHIDEventGetSenderID(IOHIDEventRef e);
+uint64_t IOHIDEventGetTimeStamp(IOHIDEventRef e);
 uint32_t IOHIDEventGetType(IOHIDEventRef e);
 
 IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uint64_t timeStamp,
@@ -52,6 +58,7 @@ void IOHIDEventSystemClientRegisterEventCallback(IOHIDEventSystemClientRef, void
 #define kIOHIDDigitizerEventIdentity 0x00000020u
 #define kIOHIDDigitizerTransducerTypeHand 3
 #define kIOHIDEventTypeDigitizer 11
+#define kIOHIDEventTypeKeyboard 3
 
 // Digitizer field selectors (same magic values long-used by touch tools).
 #define kFieldDigitizerIsDisplayInteg 0x000b0019
@@ -60,34 +67,240 @@ void IOHIDEventSystemClientRegisterEventCallback(IOHIDEventSystemClientRef, void
 #define kFieldDigitizerTouch 0x000b0009
 #define kFieldDigitizerMajorRadius 0x000b0014
 #define kFieldDigitizerMinorRadius 0x000b0015
+#define kFieldEventBuiltIn 0x00000004
 
 static uint64_t gSenderID = 0;
+static BOOL gSenderFromRegistry = NO;
 static IOHIDEventSystemClientRef gClient = NULL;
 static IOHIDEventSystemClientRef gMonitor = NULL;
+static IOHIDEventSystemConnectionRef gConnection = NULL;
+typedef void (*IOSPYConnectionDispatchFn)(IOHIDEventSystemConnectionRef, IOHIDEventRef);
+static IOSPYConnectionDispatchFn gConnectionDispatch = NULL;
+static BOOL gRoutingInitialized = NO;
+static volatile uint64_t gDispatchedEvents = 0;
+static volatile uint64_t gDispatchFailures = 0;
+static volatile uint64_t gTouchCommands = 0;
+static volatile uint64_t gTouchSubmitted = 0;
+static volatile uint64_t gTouchWithoutSender = 0;
+// The physical HID monitor also sees synthetic events. Remember the exact
+// timestamp before dispatch so black-screen mode only wakes for real local
+// touch/button input, never for input sent by the Mac.
+static volatile uint64_t gLastRemoteEventTimestamp = 0;
+static volatile uint8_t gLastTouchPhase = 0xff;
+static volatile float gLastTouchX = 0.0f;
+static volatile float gLastTouchY = 0.0f;
+
+static dispatch_queue_t inputRealtimeQueue(void) {
+    static dispatch_queue_t queue = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        queue = dispatch_queue_create("com.ioscpy.hid-realtime", attr);
+    });
+    return queue;
+}
+
+dispatch_queue_t IOSPYInputRealtimeQueue(void) {
+    return inputRealtimeQueue();
+}
+
+typedef CFArrayRef (*IOSPYCopyServicesFn)(IOHIDEventSystemClientRef);
+typedef Boolean (*IOSPYServiceConformsFn)(IOHIDServiceClientRef, uint32_t, uint32_t);
+typedef CFTypeRef (*IOSPYServiceRegistryIDFn)(IOHIDServiceClientRef);
+typedef CFTypeRef (*IOSPYServiceCopyPropertyFn)(IOHIDServiceClientRef, CFStringRef);
+
+// Resolve the built-in touch panel before the first physical touch. BackBoard's
+// sender id for a HID service is its registry id; obtaining it here removes the
+// old requirement to touch the phone once before remote input starts working.
+// Every symbol is loaded dynamically because these service APIs moved between
+// public/private header sets across iOS releases.
+static void discoverDigitizerSenderID(IOHIDEventSystemClientRef client) {
+    if (gSenderID != 0 || !client) {
+        return;
+    }
+    IOSPYCopyServicesFn copyServices =
+        (IOSPYCopyServicesFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCopyServices");
+    IOSPYServiceConformsFn conforms =
+        (IOSPYServiceConformsFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientConformsTo");
+    IOSPYServiceRegistryIDFn registryID =
+        (IOSPYServiceRegistryIDFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientGetRegistryID");
+    IOSPYServiceCopyPropertyFn copyProperty =
+        (IOSPYServiceCopyPropertyFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientCopyProperty");
+    if (!copyServices || !conforms || !registryID) {
+        return;
+    }
+
+    CFArrayRef services = copyServices(client);
+    if (!services) {
+        return;
+    }
+    uint64_t fallback = 0;
+    CFIndex count = CFArrayGetCount(services);
+    for (CFIndex i = 0; i < count; i++) {
+        IOHIDServiceClientRef service =
+            (IOHIDServiceClientRef)CFArrayGetValueAtIndex(services, i);
+        // HID Digitizers page (0x0D), Touch Screen usage (0x04).
+        if (!service || !conforms(service, 0x0D, 0x04)) {
+            continue;
+        }
+        CFTypeRef value = registryID(service);
+        uint64_t candidate = 0;
+        if (value && CFGetTypeID(value) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &candidate);
+        }
+        if (candidate == 0) {
+            continue;
+        }
+        if (fallback == 0) {
+            fallback = candidate;
+        }
+
+        BOOL builtIn = NO;
+        if (copyProperty) {
+            CFTypeRef property = copyProperty(service, CFSTR("Built-In"));
+            if (property) {
+                if (CFGetTypeID(property) == CFBooleanGetTypeID()) {
+                    builtIn = CFBooleanGetValue((CFBooleanRef)property);
+                } else if (CFGetTypeID(property) == CFNumberGetTypeID()) {
+                    int number = 0;
+                    CFNumberGetValue((CFNumberRef)property, kCFNumberIntType, &number);
+                    builtIn = number != 0;
+                }
+                CFRelease(property);
+            }
+        }
+        if (builtIn) {
+            gSenderID = candidate;
+            break;
+        }
+    }
+    if (gSenderID == 0) {
+        gSenderID = fallback;
+    }
+    CFRelease(services);
+    if (gSenderID != 0) {
+        gSenderFromRegistry = YES;
+        NSLog(@"[ioscpyhook] discovered digitizer senderID 0x%llx from HID registry",
+              gSenderID);
+    }
+}
+
+// Resolve SpringBoard's privileged event-routing connection dynamically. This
+// route is accepted on systems where direct IOHIDEventSystemClient dispatch can
+// silently discard synthetic digitizer events. Missing private classes or
+// selectors simply leave us on the regular system-client path.
+static void routingConnectionInit(void) {
+    if (gRoutingInitialized) {
+        return;
+    }
+    gRoutingInitialized = YES;
+    gConnectionDispatch = (IOSPYConnectionDispatchFn)dlsym(
+        RTLD_DEFAULT, "IOHIDEventSystemConnectionDispatchEvent");
+    if (!gConnectionDispatch) {
+        NSLog(@"[ioscpyhook] HID event-routing symbol unavailable; using system client");
+        return;
+    }
+    Class accessibility = NSClassFromString(@"BKAccessibility");
+    SEL managerSelector = NSSelectorFromString(@"_eventRoutingClientConnectionManager");
+    if (!accessibility || ![(id)accessibility respondsToSelector:managerSelector]) {
+        return;
+    }
+    id manager = ((id (*)(id, SEL))objc_msgSend)((id)accessibility, managerSelector);
+    SEL clientSelector = NSSelectorFromString(@"clientForTaskPort:");
+    if (!manager || ![manager respondsToSelector:clientSelector]) {
+        return;
+    }
+    gConnection = ((IOHIDEventSystemConnectionRef (*)(id, SEL, mach_port_t))objc_msgSend)(
+        manager, clientSelector, mach_task_self());
+    if (gConnection && gConnectionDispatch) {
+        NSLog(@"[ioscpyhook] HID event-routing connection ready");
+    }
+}
 
 // Learn the real digitizer sender id from the first physical touch. Some builds
 // drop injected events without it.
 static void senderCallback(void *target, void *refcon, void *service, IOHIDEventRef event) {
-    if (gSenderID == 0 && IOHIDEventGetType(event) == kIOHIDEventTypeDigitizer) {
-        gSenderID = IOHIDEventGetSenderID(event);
-        NSLog(@"[ioscpyhook] captured digitizer senderID 0x%llx", gSenderID);
+    uint32_t type = IOHIDEventGetType(event);
+    uint64_t timestamp = IOHIDEventGetTimeStamp(event);
+    BOOL remote = timestamp != 0 && timestamp == gLastRemoteEventTimestamp;
+    if (!remote && IOSPYRemoteBlackScreenEnabled() &&
+        (type == kIOHIDEventTypeDigitizer || type == kIOHIDEventTypeKeyboard)) {
+        IOSPYRestoreDisplayForLocalInput();
+    }
+    if (type == kIOHIDEventTypeDigitizer) {
+        uint64_t sender = IOHIDEventGetSenderID(event);
+        if (sender != 0 && sender != gSenderID) {
+            gSenderID = sender;
+            gSenderFromRegistry = NO;
+            NSLog(@"[ioscpyhook] confirmed digitizer senderID 0x%llx from touch", gSenderID);
+        }
     }
 }
 
 static void hidInit(void) {
-    if (gClient) {
-        return;
-    }
-    gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    routingConnectionInit();
     if (!gClient) {
-        NSLog(@"[ioscpyhook] IOHIDEventSystemClientCreate returned NULL (not in SpringBoard?)");
-        return;
+        gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
     }
-    gMonitor = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    if (!gClient && !gConnection) {
+        NSLog(@"[ioscpyhook] no HID dispatch client is available (not in SpringBoard?)");
+    }
+    if (!gMonitor) {
+        gMonitor = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    }
     if (gMonitor) {
+        discoverDigitizerSenderID(gMonitor);
         IOHIDEventSystemClientRegisterEventCallback(gMonitor, (void *)senderCallback, NULL, NULL);
         IOHIDEventSystemClientScheduleWithRunLoop(gMonitor, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
+}
+
+void IOSPYInputInit(void) {
+    hidInit();
+    NSLog(@"[ioscpyhook] input init route=%@ client=%d monitor=%d sender=0x%llx",
+          gConnection ? @"event-connection" : (gClient ? @"system-client" : @"none"),
+          gClient != NULL, gMonitor != NULL, gSenderID);
+}
+
+static BOOL dispatchHIDEvent(IOHIDEventRef event) {
+    if (!event) {
+        gDispatchFailures++;
+        return NO;
+    }
+    gLastRemoteEventTimestamp = IOHIDEventGetTimeStamp(event);
+    if (gConnection && gConnectionDispatch) {
+        gConnectionDispatch(gConnection, event);
+        gDispatchedEvents++;
+        return YES;
+    }
+    if (gClient) {
+        IOHIDEventSystemClientDispatchEvent(gClient, event);
+        gDispatchedEvents++;
+        return YES;
+    }
+    gDispatchFailures++;
+    return NO;
+}
+
+NSDictionary *IOSPYInputDiagnostics(void) {
+    NSString *route = gConnection ? @"event-connection" : (gClient ? @"system-client" : @"none");
+    return @{
+        @"route": route,
+        @"client_ready": @((gClient != NULL) || (gConnection != NULL)),
+        @"monitor_ready": @(gMonitor != NULL),
+        @"sender_id": @(gSenderID),
+        @"sender_source": gSenderID == 0 ? @"none" :
+            (gSenderFromRegistry ? @"registry" : @"touch"),
+        @"touch_commands": @(gTouchCommands),
+        @"touch_submitted": @(gTouchSubmitted),
+        @"touch_without_sender": @(gTouchWithoutSender),
+        @"last_phase": @(gLastTouchPhase),
+        @"last_x": @(gLastTouchX),
+        @"last_y": @(gLastTouchY),
+        @"dispatched_events": @(gDispatchedEvents),
+        @"dispatch_failures": @(gDispatchFailures),
+    };
 }
 
 // Rotate a normalized point into the panel's native-portrait space. The digitizer
@@ -179,10 +392,15 @@ static uint64_t gTouchEpoch = 0;
 static float gLastX = 0.5f;
 static float gLastY = 0.5f;
 
-void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y) {
+BOOL IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y) {
     hidInit();
-    if (!gClient) {
-        return;
+    gTouchCommands++;
+    gLastTouchPhase = (uint8_t)phase;
+    gLastTouchX = x;
+    gLastTouchY = y;
+    if (!gClient && !gConnection) {
+        gDispatchFailures++;
+        return NO;
     }
 
     gLastX = x;
@@ -194,7 +412,7 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
         // arrives, force one so the digitizer can't get stuck.
         uint64_t epoch = gTouchEpoch;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+                       inputRealtimeQueue(), ^{
             if (gTouchBalance > 0 && gTouchEpoch == epoch) {
                 IOSPYInjectTouch(IOSPYTouchUp, 0, gLastX, gLastY);
             }
@@ -219,11 +437,24 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
     IOHIDEventRef parent = IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault, ts, kIOHIDDigitizerTransducerTypeHand, 0, 0, mask, 0, 0, 0, 0, 0, 0,
         range, touch, 0);
+    if (!parent) {
+        gDispatchFailures++;
+        return NO;
+    }
+    // BackBoard checks both the digitizer-specific integrated-display field and
+    // the generic built-in field on recent iOS versions. The old implementation
+    // only set the former, which can make a syntactically valid event get dropped.
     IOHIDEventSetIntegerValue(parent, kFieldDigitizerIsDisplayInteg, 1);
+    IOHIDEventSetIntegerValue(parent, kFieldEventBuiltIn, 1);
 
     IOHIDEventRef finger = IOHIDEventCreateDigitizerFingerEvent(
         kCFAllocatorDefault, ts, (uint32_t)fingerID, (uint32_t)fingerID + 1, mask,
         (IOHIDFloat)rx, (IOHIDFloat)ry, 0, touch ? 1.0 : 0.0, 0, range, touch, 0);
+    if (!finger) {
+        gDispatchFailures++;
+        CFRelease(parent);
+        return NO;
+    }
     IOHIDEventSetFloatValue(finger, kFieldDigitizerMajorRadius, 0.04f);
     IOHIDEventSetFloatValue(finger, kFieldDigitizerMinorRadius, 0.04f);
 
@@ -243,18 +474,109 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
 
     if (gSenderID != 0) {
         IOHIDEventSetSenderID(parent, gSenderID);
+        IOHIDEventSetSenderID(finger, gSenderID);
+    } else {
+        // The privileged event-routing connection can accept sender-less events,
+        // but the plain system-client path often cannot. Keep the attempt for
+        // compatibility and surface the condition in telemetry instead of
+        // silently reporting it as a confirmed touch.
+        gTouchWithoutSender++;
     }
 
-    IOHIDEventSystemClientDispatchEvent(gClient, parent);
+    BOOL submitted = dispatchHIDEvent(parent);
+    if (submitted) {
+        gTouchSubmitted++;
+    }
 
     CFRelease(finger);
     CFRelease(parent);
+    return submitted;
+}
+
+static dispatch_source_t gScrollTimer = NULL;
+static BOOL gScrollActive = NO;
+static float gScrollX = 0.5f;
+static float gScrollY = 0.5f;
+static float gScrollPendingX = 0;
+static float gScrollPendingY = 0;
+static CFAbsoluteTime gScrollLastInput = 0;
+
+static float clampUnit(float value) {
+    return fminf(0.97f, fmaxf(0.03f, value));
+}
+
+static void ensureScrollTimer(void) {
+    if (gScrollTimer) {
+        return;
+    }
+    gScrollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                          inputRealtimeQueue());
+    uint64_t interval = NSEC_PER_SEC / 120;
+    dispatch_source_set_timer(gScrollTimer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              interval, interval / 4);
+    dispatch_source_set_event_handler(gScrollTimer, ^{
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        float magnitude = fabsf(gScrollPendingX) + fabsf(gScrollPendingY);
+        if (!gScrollActive && magnitude > 0.0001f) {
+            gScrollActive = YES;
+            IOSPYInjectTouch(IOSPYTouchDown, 7, gScrollX, gScrollY);
+        }
+        if (gScrollActive && magnitude > 0.0001f) {
+            // Exponential consumption gives coarse wheel notches a short, smooth
+            // glide while precise trackpad deltas remain closely time-aligned.
+            float stepX = gScrollPendingX * 0.32f;
+            float stepY = gScrollPendingY * 0.32f;
+            if (fabsf(stepX) < 0.00025f) stepX = copysignf(0.00025f, stepX);
+            if (fabsf(stepY) < 0.00025f) stepY = copysignf(0.00025f, stepY);
+            if (fabsf(stepX) > fabsf(gScrollPendingX)) stepX = gScrollPendingX;
+            if (fabsf(stepY) > fabsf(gScrollPendingY)) stepY = gScrollPendingY;
+            gScrollPendingX -= stepX;
+            gScrollPendingY -= stepY;
+            gScrollX = clampUnit(gScrollX + stepX);
+            gScrollY = clampUnit(gScrollY + stepY);
+            IOSPYInjectTouch(IOSPYTouchMove, 7, gScrollX, gScrollY);
+        }
+        if (gScrollActive && magnitude <= 0.0001f && now - gScrollLastInput > 0.075) {
+            IOSPYInjectTouch(IOSPYTouchUp, 7, gScrollX, gScrollY);
+            gScrollActive = NO;
+            gScrollPendingX = 0;
+            gScrollPendingY = 0;
+        }
+    });
+    dispatch_resume(gScrollTimer);
+}
+
+void IOSPYInjectScroll(uint8_t phase, uint8_t momentumPhase, BOOL precise,
+                       float deltaX, float deltaY, float x, float y) {
+    dispatch_async(inputRealtimeQueue(), ^{
+        ensureScrollTimer();
+        gScrollLastInput = CFAbsoluteTimeGetCurrent();
+        if (!gScrollActive && fabsf(gScrollPendingX) + fabsf(gScrollPendingY) < 0.0001f) {
+            gScrollX = clampUnit(x);
+            gScrollY = clampUnit(y);
+        }
+        // AppKit reports content-scrolling deltas; a synthetic finger must move
+        // in the opposite direction to produce the same content motion.
+        float factor = precise ? 0.0018f : 0.0075f;
+        gScrollPendingX += -deltaX * factor;
+        gScrollPendingY += deltaY * factor;
+        gScrollPendingX = fminf(0.24f, fmaxf(-0.24f, gScrollPendingX));
+        gScrollPendingY = fminf(0.24f, fmaxf(-0.24f, gScrollPendingY));
+
+        BOOL cancelled = phase == 4 || momentumPhase == 4;
+        if (cancelled && gScrollActive) {
+            IOSPYInjectTouch(IOSPYTouchUp, 7, gScrollX, gScrollY);
+            gScrollActive = NO;
+            gScrollPendingX = 0;
+            gScrollPendingY = 0;
+        }
+    });
 }
 
 // Press and release a HID button (e.g. the home button as consumer "menu").
 static void injectButton(uint32_t usagePage, uint32_t usage) {
     hidInit();
-    if (!gClient) {
+    if (!gClient && !gConnection) {
         return;
     }
     for (int down = 1; down >= 0; down--) {
@@ -266,7 +588,7 @@ static void injectButton(uint32_t usagePage, uint32_t usage) {
         if (gSenderID != 0) {
             IOHIDEventSetSenderID(e, gSenderID);
         }
-        IOHIDEventSystemClientDispatchEvent(gClient, e);
+        dispatchHIDEvent(e);
         CFRelease(e);
     }
 }
@@ -279,7 +601,7 @@ static void injectButton(uint32_t usagePage, uint32_t usage) {
 
 static void keyEvent(uint32_t usage, bool down) {
     hidInit();
-    if (!gClient) {
+    if (!gClient && !gConnection) {
         return;
     }
     IOHIDEventRef e = IOHIDEventCreateKeyboardEvent(kCFAllocatorDefault, mach_absolute_time(),
@@ -289,7 +611,7 @@ static void keyEvent(uint32_t usage, bool down) {
     }
     // Keyboard events route best with NO sender id (the captured one belongs to
     // the touch panel). Only set it if typing doesn't land during testing.
-    IOHIDEventSystemClientDispatchEvent(gClient, e);
+    dispatchHIDEvent(e);
     CFRelease(e);
 }
 
@@ -412,6 +734,8 @@ void IOSPYKeyAction(uint8_t code) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
 
+static void actionWake(void);
+
 static id sharedOf(const char *cls) {
     Class c = objc_getClass(cls);
     if (!c) {
@@ -424,6 +748,62 @@ static id sharedOf(const char *cls) {
         return [c performSelector:@selector(sharedInstanceIfExists)];
     }
     return nil;
+}
+
+void IOSPYUnlockWithPasscode(NSString *passcode) {
+    if (passcode.length < 4 || passcode.length > 8) {
+        NSLog(@"[ioscpyhook] refusing unlock passcode with invalid length");
+        return;
+    }
+    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    if ([passcode rangeOfCharacterFromSet:nonDigits].location != NSNotFound) {
+        NSLog(@"[ioscpyhook] refusing non-numeric unlock passcode");
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id manager = sharedOf("SBLockScreenManager");
+        BOOL locked = NO;
+        SEL lockedSelector = NSSelectorFromString(@"isUILocked");
+        if ([manager respondsToSelector:lockedSelector]) {
+            locked = ((BOOL (*)(id, SEL))objc_msgSend)(manager, lockedSelector);
+        } else {
+            id cover = sharedOf("SBCoverSheetPresentationManager");
+            SEL presented = NSSelectorFromString(@"isPresented");
+            if ([cover respondsToSelector:presented]) {
+                locked = ((BOOL (*)(id, SEL))objc_msgSend)(cover, presented);
+            }
+        }
+        if (!locked) {
+            NSLog(@"[ioscpyhook] auto-unlock skipped: device is not on the lock UI");
+            return;
+        }
+
+        IOSPYRestoreDisplayForLocalInput();
+        actionWake();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            // Re-check immediately before typing. This is the guard that keeps a
+            // delayed reconnect from entering the saved passcode into an app.
+            BOOL stillLocked = YES;
+            if ([manager respondsToSelector:lockedSelector]) {
+                stillLocked = ((BOOL (*)(id, SEL))objc_msgSend)(manager, lockedSelector);
+            }
+            if (!stillLocked) {
+                NSLog(@"[ioscpyhook] auto-unlock cancelled: lock state changed");
+                return;
+            }
+            for (NSUInteger i = 0; i < passcode.length; i++) {
+                unichar digit = [passcode characterAtIndex:i];
+                uint32_t usage = digit == '0' ? 0x27 : (0x1E + (digit - '1'));
+                typeUsage(usage, false);
+            }
+            // Some lock-screen layouts submit at the final digit, while others
+            // accept Return. Sending Return after a short delay is harmless when
+            // the final digit already completed the unlock.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ typeUsage(0x28, false); });
+        });
+    });
 }
 
 // Close Control Center / Notification Center if they're showing. The HID home

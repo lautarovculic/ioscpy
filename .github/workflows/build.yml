@@ -1,0 +1,195 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - "ci/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-checks:
+    name: Rust protocol checks
+    runs-on: macos-26
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            host/target
+          key: ${{ runner.os }}-${{ runner.arch }}-checks-${{ hashFiles('host/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-checks-
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path host/Cargo.toml --locked --all-targets --all-features
+
+      - name: Run tests
+        run: cargo test --manifest-path host/Cargo.toml --locked --all-targets
+
+  macos-host:
+    name: Native macOS 26 app
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache Swift build data
+        uses: actions/cache@v4
+        with:
+          path: macos/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-swift-${{ hashFiles('macos/Package.swift', 'macos/Sources/**/*.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-swift-
+
+      - name: Verify build environment
+        run: |
+          swift --version
+          test "$(uname -m)" = arm64
+          xcrun --show-sdk-version
+
+      - name: Build native app bundle
+        run: |
+          chmod +x scripts/build-macos-app.sh
+          scripts/build-macos-app.sh dist/macos
+          codesign --verify --deep --strict "dist/macos/ioscpy dream.app"
+          file "dist/macos/ioscpy dream.app/Contents/MacOS/ioscpy-dream"
+          plutil -lint "dist/macos/ioscpy dream.app/Contents/Info.plist"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("dist/macos/build-manifest-macos.json")
+          data = json.loads(p.read_text())
+          data["commit"] = "${{ github.sha }}"
+          p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+          PY
+
+      - name: Upload macOS app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioscpy-macos-app
+          path: |
+            dist/macos/*.zip
+            dist/macos/SHA256SUMS-macos
+            dist/macos/build-manifest-macos.json
+          if-no-files-found: error
+
+  device-package:
+    name: iOS device package (${{ matrix.scheme }})
+    runs-on: macos-26
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: rootless
+            make_target: device-rootless
+          - scheme: rootful
+            make_target: device-rootful
+    env:
+      THEOS: ${{ github.workspace }}/.theos
+      THEOS_REVISION: 16362d3aa83a0acd56df4493d575d34306d42478
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install packaging dependencies
+        run: brew install dpkg ldid xz
+
+      - name: Install Theos
+        run: |
+          git clone --filter=blob:none https://github.com/theos/theos.git "$THEOS"
+          git -C "$THEOS" checkout --detach "$THEOS_REVISION"
+          git -C "$THEOS" submodule update --init --recursive --depth 1
+          test "$(git -C "$THEOS" rev-parse HEAD)" = "$THEOS_REVISION"
+
+      - name: Build ${{ matrix.scheme }} package
+        run: make ${{ matrix.make_target }}
+
+      - name: Collect device package
+        run: |
+          mkdir -p "dist/device/${{ matrix.scheme }}"
+          find device/packages -maxdepth 1 -type f -name '*.deb' \
+            -exec cp {} "dist/device/${{ matrix.scheme }}/" \;
+          test -n "$(find "dist/device/${{ matrix.scheme }}" -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          shasum -a 256 "dist/device/${{ matrix.scheme }}"/*.deb \
+            > "dist/SHA256SUMS-${{ matrix.scheme }}"
+          VERSION="$(sed -n 's/^Version: //p' device/control | head -1)"
+          printf '{"version":"%s","commit":"%s","platform":"ios","scheme":"%s"}\n' \
+            "$VERSION" "$GITHUB_SHA" "${{ matrix.scheme }}" \
+            > "dist/build-manifest-${{ matrix.scheme }}.json"
+
+      - name: Upload ${{ matrix.scheme }} package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioscpy-device-${{ matrix.scheme }}
+          path: |
+            dist/device/${{ matrix.scheme }}/*.deb
+            dist/SHA256SUMS-${{ matrix.scheme }}
+            dist/build-manifest-${{ matrix.scheme }}.json
+          if-no-files-found: error
+
+  complete-bundle:
+    name: Complete test bundle
+    runs-on: macos-26
+    needs: [host-checks, macos-host, device-package]
+    timeout-minutes: 10
+
+    steps:
+      - name: Download macOS app
+        uses: actions/download-artifact@v4
+        with:
+          name: ioscpy-macos-app
+          path: dist/complete/macos
+
+      - name: Download rootless device package
+        uses: actions/download-artifact@v4
+        with:
+          name: ioscpy-device-rootless
+          path: dist/complete/iphone
+
+      - name: Assemble complete archive
+        run: |
+          VERSION="0.3.0-dream.9"
+          printf '%s\n' \
+            'Install the rootless .deb on the iPhone, run sbreload, then open the macOS app.' \
+            'The macOS app is ad-hoc signed only and is not notarized.' \
+            'USB mode currently requires libimobiledevice: brew install libimobiledevice.' \
+            > dist/complete/TESTING.txt
+          ditto -c -k --keepParent dist/complete "dist/ioscpy-dream-${VERSION}-complete.zip"
+          shasum -a 256 "dist/ioscpy-dream-${VERSION}-complete.zip" > dist/SHA256SUMS-complete
+
+      - name: Upload complete bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioscpy-dream-complete
+          path: |
+            dist/ioscpy-dream-*-complete.zip
+            dist/SHA256SUMS-complete
+          if-no-files-found: error

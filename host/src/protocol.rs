@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 pub const MAGIC: u32 = 0x4943_5059; // "ICPY"
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const HEADER_SIZE: usize = 32;
 pub const DEFAULT_PORT: u16 = 27183;
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
@@ -15,6 +15,8 @@ pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 pub const CHANNEL_CONTROL: u64 = 0;
 #[allow(dead_code)]
 pub const CHANNEL_VIDEO: u64 = 1;
+#[allow(dead_code)]
+pub const CHANNEL_AUDIO: u64 = 2;
 
 // Flag bits in the 16-byte VIDEO_FRAME sub-header (not the frame header) that
 // tell the host how to read the encoded bytes. A plain JPEG frame clears them all.
@@ -27,11 +29,98 @@ pub const VIDEO_FLAG_KEYFRAME: u32 = 0x2;
 /// SPS/PPS parameter sets are prepended to this frame's data.
 #[allow(dead_code)]
 pub const VIDEO_FLAG_CONFIG: u32 = 0x4;
+/// HEVC/H.265 payload. Mutually exclusive with [`VIDEO_FLAG_H264`].
+#[allow(dead_code)]
+pub const VIDEO_FLAG_HEVC: u32 = 0x20;
 
 // Codec selector, the 1-byte START_STREAM payload. An empty payload also means
 // MJPEG so an older daemon still streams a picture.
 pub const VIDEO_CODEC_MJPEG: u8 = 0;
 pub const VIDEO_CODEC_H264: u8 = 1;
+pub const VIDEO_CODEC_HEVC: u8 = 2;
+
+/// Versioned START_STREAM payload. Older daemons only inspect byte zero, so the
+/// extended fields remain backward-compatible with the original codec byte.
+pub const STREAM_CONFIG_VERSION: u8 = 2;
+pub const STREAM_CONFIG_SIZE: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum LatencyMode {
+    Quality = 0,
+    Balanced = 1,
+    LowLatency = 2,
+    HighRefresh = 3,
+}
+
+impl LatencyMode {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Quality,
+            2 => Self::LowLatency,
+            3 => Self::HighRefresh,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamConfig {
+    pub codec: u8,
+    pub target_fps: u16,
+    pub max_dimension: u16,
+    pub latency_mode: LatencyMode,
+    pub bitrate_bps: u32,
+    pub keyframe_interval_frames: u16,
+}
+
+impl StreamConfig {
+    pub fn legacy(codec: u8) -> Self {
+        Self {
+            codec,
+            target_fps: 45,
+            max_dimension: 1600,
+            latency_mode: LatencyMode::Balanced,
+            bitrate_bps: 8_000_000,
+            keyframe_interval_frames: 180,
+        }
+    }
+
+    pub fn encode(self) -> [u8; STREAM_CONFIG_SIZE] {
+        let mut payload = [0u8; STREAM_CONFIG_SIZE];
+        payload[0] = self.codec;
+        payload[1] = STREAM_CONFIG_VERSION;
+        payload[2..4].copy_from_slice(&self.target_fps.to_be_bytes());
+        payload[4..6].copy_from_slice(&self.max_dimension.to_be_bytes());
+        payload[6] = self.latency_mode as u8;
+        payload[8..12].copy_from_slice(&self.bitrate_bps.to_be_bytes());
+        payload[12..14].copy_from_slice(&self.keyframe_interval_frames.to_be_bytes());
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Self {
+        let codec = payload.first().copied().unwrap_or(VIDEO_CODEC_MJPEG);
+        if payload.len() < STREAM_CONFIG_SIZE
+            || (payload[1] != 1 && payload[1] != STREAM_CONFIG_VERSION)
+        {
+            return Self::legacy(codec);
+        }
+        let target_fps = u16::from_be_bytes([payload[2], payload[3]]).clamp(1, 240);
+        let max_dimension = u16::from_be_bytes([payload[4], payload[5]]).clamp(320, 4096);
+        let bitrate_bps =
+            u32::from_be_bytes(payload[8..12].try_into().unwrap()).clamp(500_000, 100_000_000);
+        let keyframe_interval_frames =
+            u16::from_be_bytes([payload[12], payload[13]]).clamp(1, 60_000);
+        Self {
+            codec,
+            target_fps,
+            max_dimension,
+            latency_mode: LatencyMode::from_u8(payload[6]),
+            bitrate_bps,
+            keyframe_interval_frames,
+        }
+    }
+}
 
 // Capture orientation packed into VIDEO_FRAME flags bits 3-4 (value =
 // orientation - 1). The frame is always the device's portrait framebuffer.
@@ -53,6 +142,7 @@ pub enum MessageType {
     CapabilitiesRequest = 3,
     CapabilitiesResponse = 4,
     Authenticate = 5,
+    PairResult = 6,
     StartStream = 10,
     StopStream = 11,
     VideoFrame = 12,
@@ -60,6 +150,7 @@ pub enum MessageType {
     InputTouch = 20,
     InputKey = 21,
     InputText = 22,
+    InputScroll = 23,
     ClipboardGet = 30,
     ClipboardSet = 31,
     ClipboardChanged = 32,
@@ -67,10 +158,16 @@ pub enum MessageType {
     ScreenInfo = 41,
     SystemAction = 50,
     KeyboardMode = 51,
+    DisplayMode = 52,
+    AudioMode = 53,
+    Unlock = 54,
     Ping = 60,
     Pong = 61,
     Error = 70,
     Log = 71,
+    Stats = 72,
+    AudioFrame = 73,
+    MediaBind = 74,
 }
 
 impl MessageType {
@@ -82,6 +179,7 @@ impl MessageType {
             3 => CapabilitiesRequest,
             4 => CapabilitiesResponse,
             5 => Authenticate,
+            6 => PairResult,
             10 => StartStream,
             11 => StopStream,
             12 => VideoFrame,
@@ -89,6 +187,7 @@ impl MessageType {
             20 => InputTouch,
             21 => InputKey,
             22 => InputText,
+            23 => InputScroll,
             30 => ClipboardGet,
             31 => ClipboardSet,
             32 => ClipboardChanged,
@@ -96,10 +195,16 @@ impl MessageType {
             41 => ScreenInfo,
             50 => SystemAction,
             51 => KeyboardMode,
+            52 => DisplayMode,
+            53 => AudioMode,
+            54 => Unlock,
             60 => Ping,
             61 => Pong,
             70 => Error,
             71 => Log,
+            72 => Stats,
+            73 => AudioFrame,
+            74 => MediaBind,
             _ => return None,
         })
     }
@@ -232,6 +337,8 @@ pub struct Hello {
     pub host_version: String,
     pub protocol_version: u16,
     pub nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +373,8 @@ pub struct Capabilities {
     pub keyboard: bool,
     #[serde(default)]
     pub orientation: bool,
+    #[serde(default)]
+    pub lan: bool,
 }
 
 /// Touch phase, the first byte of an INPUT_TOUCH payload.
@@ -374,6 +483,74 @@ pub struct LogMessage {
     pub message: String,
 }
 
+/// Periodic device-side stream counters. Values describe the most recent
+/// reporting window except `uptime_ms`, which is monotonic for the stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceStreamStats {
+    #[serde(default)]
+    pub uptime_ms: u64,
+    #[serde(default)]
+    pub requested_fps: u16,
+    #[serde(default)]
+    pub configured_max_dimension: u16,
+    #[serde(default)]
+    pub max_dimension: u16,
+    #[serde(default)]
+    pub bitrate_bps: u32,
+    #[serde(default)]
+    pub encode_inflight: u32,
+    #[serde(default)]
+    pub send_backlog: u32,
+    #[serde(default)]
+    pub capture_ticks: u64,
+    #[serde(default)]
+    pub captured_frames: u64,
+    #[serde(default)]
+    pub encoded_frames: u64,
+    #[serde(default)]
+    pub sent_frames: u64,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    #[serde(default)]
+    pub capture_ms_avg: f64,
+    #[serde(default)]
+    pub encode_ms_avg: f64,
+    #[serde(default)]
+    pub send_ms_avg: f64,
+    #[serde(default)]
+    pub input: DeviceInputStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceInputStats {
+    #[serde(default)]
+    pub route: String,
+    #[serde(default)]
+    pub client_ready: bool,
+    #[serde(default)]
+    pub monitor_ready: bool,
+    #[serde(default)]
+    pub sender_id: u64,
+    #[serde(default)]
+    pub sender_source: String,
+    #[serde(default)]
+    pub touch_commands: u64,
+    #[serde(default)]
+    pub touch_submitted: u64,
+    #[serde(default)]
+    pub touch_without_sender: u64,
+    #[serde(default)]
+    pub last_phase: u8,
+    #[serde(default)]
+    pub last_x: f32,
+    #[serde(default)]
+    pub last_y: f32,
+    #[serde(default)]
+    pub dispatched_events: u64,
+    #[serde(default)]
+    pub dispatch_failures: u64,
+}
+
 fn default_level() -> String {
     "info".to_string()
 }
@@ -428,12 +605,14 @@ pub fn random_hex(bytes: usize) -> String {
 pub fn handshake<S: Read + Write>(
     stream: &mut S,
     host_version: &str,
+    pair_token: Option<&str>,
 ) -> Result<HelloAck, ProtocolError> {
     let hello = Hello {
         role: "host",
         host_version: host_version.to_string(),
         protocol_version: PROTOCOL_VERSION,
         nonce: random_hex(16),
+        pair_token: pair_token.map(str::to_owned),
     };
     let body = serde_json::to_vec(&hello)?;
     write_frame(stream, MessageType::Hello, CHANNEL_CONTROL, 0, &body)?;
@@ -506,10 +685,33 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        for v in [1u16, 2, 5, 12, 13, 50, 60, 61, 70, 71] {
+        for v in [
+            1u16, 2, 5, 6, 12, 13, 23, 50, 52, 53, 54, 60, 61, 70, 71, 72, 73, 74,
+        ] {
             let mt = MessageType::from_u16(v).unwrap();
             assert_eq!(mt as u16, v);
         }
         assert!(MessageType::from_u16(9999).is_none());
+    }
+
+    #[test]
+    fn stream_config_roundtrip() {
+        let config = StreamConfig {
+            codec: VIDEO_CODEC_H264,
+            target_fps: 90,
+            max_dimension: 1280,
+            latency_mode: LatencyMode::HighRefresh,
+            bitrate_bps: 12_000_000,
+            keyframe_interval_frames: 180,
+        };
+        assert_eq!(StreamConfig::decode(&config.encode()), config);
+    }
+
+    #[test]
+    fn stream_config_accepts_legacy_codec_byte() {
+        assert_eq!(
+            StreamConfig::decode(&[VIDEO_CODEC_H264]),
+            StreamConfig::legacy(VIDEO_CODEC_H264)
+        );
     }
 }

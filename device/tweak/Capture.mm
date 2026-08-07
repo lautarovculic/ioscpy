@@ -2,8 +2,10 @@
 #import <UIKit/UIKit.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <ImageIO/ImageIO.h>
-#import <MobileCoreServices/MobileCoreServices.h>
+#import <VideoToolbox/VideoToolbox.h>
+#import <CoreVideo/CoreVideo.h>
 #import <dlfcn.h>
+#import <os/lock.h>
 
 // The render server can blit the live display straight into an IOSurface. It's
 // a long-standing private QuartzCore entry point; we resolve it at runtime so a
@@ -92,32 +94,119 @@ static IOSurfaceRef surfaceForSize(int width, int height) {
     return surface;
 }
 
-// Destination surface for the H.264 path, recreated only when the target size
-// changes. Kept separate from the native source surface above.
-static IOSurfaceRef destSurfaceForSize(int width, int height) {
-    static IOSurfaceRef surface = NULL;
-    static int cachedW = 0, cachedH = 0;
-    if (surface && cachedW == width && cachedH == height) {
-        return surface;
-    }
-    if (surface) {
-        CFRelease(surface);
-        surface = NULL;
-    }
+static IOSurfaceRef createBGRASurface(int width, int height) {
     NSDictionary *props = @{
         (id)kIOSurfaceWidth: @(width),
         (id)kIOSurfaceHeight: @(height),
         (id)kIOSurfaceBytesPerElement: @4,
         (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
     };
-    surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-    cachedW = width;
-    cachedH = height;
-    return surface;
+    return IOSurfaceCreate((__bridge CFDictionaryRef)props);
 }
 
-IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int *outHeight) {
+// Native-resolution HEVC can hold roughly six surfaces for ~45-50 ms while still
+// sustaining 120 submissions/s. A six-slot pool therefore had zero scheduling
+// margin and telemetry showed it pinning at 6/6 under motion, dropping 14-17
+// capture opportunities/s. Keep two bounded spare surfaces so transient encoder
+// service-time jitter does not turn into a hard ~100 FPS ceiling.
+static const int kCaptureSlotCount = 8;
+typedef struct {
+    IOSurfaceRef source;
+    IOSurfaceRef scaled;
+    int sourceW;
+    int sourceH;
+    int scaledW;
+    int scaledH;
+    BOOL busy;
+} IOSPYCaptureSlot;
+
+static IOSPYCaptureSlot gCaptureSlots[kCaptureSlotCount] = {};
+static os_unfair_lock gCapturePoolLock = OS_UNFAIR_LOCK_INIT;
+
+static int acquireCaptureSlot(int sourceW, int sourceH, int targetW, int targetH) {
+    os_unfair_lock_lock(&gCapturePoolLock);
+    int token = -1;
+    for (int i = 0; i < kCaptureSlotCount; i++) {
+        IOSPYCaptureSlot *slot = &gCaptureSlots[i];
+        if (slot->busy) {
+            continue;
+        }
+        if (!slot->source || slot->sourceW != sourceW || slot->sourceH != sourceH) {
+            if (slot->source) {
+                CFRelease(slot->source);
+            }
+            slot->source = createBGRASurface(sourceW, sourceH);
+            slot->sourceW = sourceW;
+            slot->sourceH = sourceH;
+        }
+        if (targetW != sourceW || targetH != sourceH) {
+            if (!slot->scaled || slot->scaledW != targetW || slot->scaledH != targetH) {
+                if (slot->scaled) {
+                    CFRelease(slot->scaled);
+                }
+                slot->scaled = createBGRASurface(targetW, targetH);
+                slot->scaledW = targetW;
+                slot->scaledH = targetH;
+            }
+        }
+        if (slot->source &&
+            ((targetW == sourceW && targetH == sourceH) || slot->scaled)) {
+            slot->busy = YES;
+            token = i;
+        }
+        break;
+    }
+    os_unfair_lock_unlock(&gCapturePoolLock);
+    return token;
+}
+
+void IOSPYReleaseCaptureSurface(int token) {
+    if (token < 0 || token >= kCaptureSlotCount) {
+        return;
+    }
+    os_unfair_lock_lock(&gCapturePoolLock);
+    gCaptureSlots[token].busy = NO;
+    os_unfair_lock_unlock(&gCapturePoolLock);
+}
+
+static BOOL transferSurface(IOSurfaceRef source, IOSurfaceRef destination) {
+    static VTPixelTransferSessionRef transfer = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &transfer) == noErr && transfer) {
+            VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_ScalingMode,
+                                 kVTScalingMode_Normal);
+        }
+    });
+    if (!transfer || !source || !destination) {
+        return NO;
+    }
+    CVPixelBufferRef sourceBuffer = NULL;
+    CVPixelBufferRef destinationBuffer = NULL;
+    CVReturn sourceStatus =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, source, NULL, &sourceBuffer);
+    CVReturn destinationStatus =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, destination, NULL,
+                                         &destinationBuffer);
+    if (sourceStatus != kCVReturnSuccess || destinationStatus != kCVReturnSuccess ||
+        !sourceBuffer || !destinationBuffer) {
+        if (sourceBuffer) CVPixelBufferRelease(sourceBuffer);
+        if (destinationBuffer) CVPixelBufferRelease(destinationBuffer);
+        return NO;
+    }
+    OSStatus status =
+        VTPixelTransferSessionTransferImage(transfer, sourceBuffer, destinationBuffer);
+    CVPixelBufferRelease(sourceBuffer);
+    CVPixelBufferRelease(destinationBuffer);
+    return status == noErr;
+}
+
+IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int *outHeight,
+                                       int *outToken) {
     @autoreleasepool {
+        if (outToken) {
+            *outToken = -1;
+        }
         CARenderServerRenderDisplayFn render = renderDisplayFn();
         if (!render) {
             return NULL;
@@ -143,44 +232,21 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
         if (tw < 2) tw = 2;
         if (th < 2) th = 2;
 
-        IOSurfaceRef src = surfaceForSize(nw, nh);
-        IOSurfaceRef dst = destSurfaceForSize(tw, th);
-        if (!src || !dst) {
+        int token = acquireCaptureSlot(nw, nh, tw, th);
+        if (token < 0) {
+            return NULL;
+        }
+        IOSPYCaptureSlot *slot = &gCaptureSlots[token];
+        IOSurfaceRef src = slot->source;
+        IOSurfaceRef output = (tw == nw && th == nh) ? src : slot->scaled;
+        if (!src || !output) {
+            IOSPYReleaseCaptureSurface(token);
             return NULL;
         }
 
-        const uint32_t bgra = kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little;
-        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
         render(0, mainDisplayName(), src, 0, 0);
-
-        IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL);
-        void *base = IOSurfaceGetBaseAddress(src);
-        size_t bytesPerRow = IOSurfaceGetBytesPerRow(src);
-        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, base, bytesPerRow * nh, NULL);
-        CGImageRef nativeImage = CGImageCreate(nw, nh, 8, 32, bytesPerRow, space, bgra, provider,
-                                               NULL, false, kCGRenderingIntentDefault);
-
-        BOOL ok = NO;
-        if (nativeImage) {
-            IOSurfaceLock(dst, 0, NULL);
-            void *dbase = IOSurfaceGetBaseAddress(dst);
-            size_t dbpr = IOSurfaceGetBytesPerRow(dst);
-            CGContextRef ctx = CGBitmapContextCreate(dbase, tw, th, 8, dbpr, space, bgra);
-            if (ctx) {
-                CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
-                CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), nativeImage);
-                CGContextRelease(ctx);
-                ok = YES;
-            }
-            IOSurfaceUnlock(dst, 0, NULL);
-        }
-
-        CGImageRelease(nativeImage);
-        CGDataProviderRelease(provider);
-        IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
-        CGColorSpaceRelease(space);
-
-        if (!ok) {
+        if (output != src && !transferSurface(src, output)) {
+            IOSPYReleaseCaptureSurface(token);
             return NULL;
         }
         if (outWidth) {
@@ -189,7 +255,10 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
         if (outHeight) {
             *outHeight = th;
         }
-        return dst;
+        if (outToken) {
+            *outToken = token;
+        }
+        return output;
     }
 }
 
@@ -265,8 +334,13 @@ NSData *IOSPYCaptureScreenJPEG(CGFloat maxDimension, CGFloat quality,
 
         double encodeStart = nowMs();
         NSMutableData *data = [NSMutableData data];
+        // ImageIO expects a UTI string here. kUTTypeJPEG lived in the legacy
+        // MobileCoreServices headers and is no longer exposed by current Apple
+        // SDKs used by GitHub's macOS runners. "public.jpeg" is the canonical
+        // JPEG UTI and keeps the tweak buildable across old and new SDKs.
+        CFStringRef jpegType = CFSTR("public.jpeg");
         CGImageDestinationRef dest =
-            CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, kUTTypeJPEG, 1, NULL);
+            CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, jpegType, 1, NULL);
         BOOL ok = NO;
         if (dest) {
             NSDictionary *options = @{(__bridge id)kCGImageDestinationLossyCompressionQuality: @(quality)};

@@ -58,7 +58,7 @@ static BOOL gSuppressPasteAlert = NO;
 %ctor {
     @autoreleasepool {
         NSString *process = [[NSProcessInfo processInfo] processName];
-        NSLog(@"[ioscpyhook] loaded into %@ (v0.1.5)", process);
+        NSLog(@"[ioscpyhook] loaded into %@ (0.3.0-dream.9)", process);
 
         // Leave a small breadcrumb others can stat to confirm the hook loaded.
         NSString *dir = @"/var/mobile/Library/Preferences";
@@ -70,6 +70,7 @@ static BOOL gSuppressPasteAlert = NO;
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
         gSuppressPasteAlert = (v.majorVersion >= 16);
 
+        IOSPYInputInit();
         IOSPYOrientationStart();
         IOSPYKeyboardSuppressionInit();
         [[IOSPYStreamClient shared] start];

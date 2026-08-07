@@ -21,6 +21,45 @@ static uint64_t ntoh64(uint64_t v) {
     return hton64(v); // byte reversal is its own inverse
 }
 
+IOSPYStreamConfig IOSPYParseStreamConfig(NSData *payload) {
+    IOSPYStreamConfig config = {
+        .codec = IOSPY_VIDEO_CODEC_MJPEG,
+        .target_fps = 45,
+        .max_dimension = 1600,
+        .latency_mode = IOSPYLatencyBalanced,
+        .bitrate_bps = 8 * 1000 * 1000,
+        .keyframe_interval_frames = 180,
+    };
+    if (payload.length >= 1) {
+        config.codec = ((const uint8_t *)payload.bytes)[0];
+    }
+    if (payload.length < IOSPY_STREAM_CONFIG_SIZE) {
+        return config;
+    }
+    const uint8_t *b = (const uint8_t *)payload.bytes;
+    if (b[1] != 1 && b[1] != IOSPY_STREAM_CONFIG_VERSION) {
+        return config;
+    }
+
+    uint16_t fps, maxDimension, keyframeInterval;
+    uint32_t bitrate;
+    memcpy(&fps, b + 2, sizeof(fps));
+    memcpy(&maxDimension, b + 4, sizeof(maxDimension));
+    memcpy(&bitrate, b + 8, sizeof(bitrate));
+    memcpy(&keyframeInterval, b + 12, sizeof(keyframeInterval));
+    fps = ntohs(fps);
+    maxDimension = ntohs(maxDimension);
+    bitrate = ntohl(bitrate);
+    keyframeInterval = ntohs(keyframeInterval);
+
+    config.target_fps = MIN(MAX(fps, 1), 240);
+    config.max_dimension = MIN(MAX(maxDimension, 320), 4096);
+    config.latency_mode = b[6] <= IOSPYLatencyHighRefresh ? b[6] : IOSPYLatencyBalanced;
+    config.bitrate_bps = MIN(MAX(bitrate, 500000u), 100000000u);
+    config.keyframe_interval_frames = MIN(MAX(keyframeInterval, 1), 60000);
+    return config;
+}
+
 // Read exactly len bytes, looping over short reads. Returns NO on EOF or error.
 static BOOL readFull(int fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;

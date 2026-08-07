@@ -25,14 +25,18 @@ impl Device {
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<String> {
-    let exe = crate::platform::tool_path(cmd)
-        .ok_or_else(|| anyhow!("couldn't find `{cmd}`. {}", crate::platform::missing_tools_hint()))?;
-    let out = Command::new(&exe)
-        .args(args)
-        .output()
-        .with_context(|| {
-            format!("couldn't run `{cmd}`. {}", crate::platform::missing_tools_hint())
-        })?;
+    let exe = crate::platform::tool_path(cmd).ok_or_else(|| {
+        anyhow!(
+            "couldn't find `{cmd}`. {}",
+            crate::platform::missing_tools_hint()
+        )
+    })?;
+    let out = Command::new(&exe).args(args).output().with_context(|| {
+        format!(
+            "couldn't run `{cmd}`. {}",
+            crate::platform::missing_tools_hint()
+        )
+    })?;
     if !out.status.success() {
         bail!(
             "`{cmd} {}` failed: {}",

@@ -14,8 +14,9 @@
 // Whether a tweak is currently connected and able to stream.
 - (BOOL)tweakConnected;
 
-// Tell the tweak to begin capturing with a codec (0 = MJPEG, 1 = H.264) / stop.
-- (void)tellTweakStartCodec:(uint8_t)codec;
+// Tell the tweak to begin capturing with the versioned START_STREAM payload.
+// Byte zero remains the codec selector for compatibility.
+- (void)tellTweakStartPayload:(NSData *)payload;
 - (void)tellTweakStop;
 
 // Choose how incoming video frames reach the host. MJPEG (NO) keeps only the
@@ -31,5 +32,12 @@
 // control server's per-connection lock, shared so writes don't interleave with
 // the video pump.
 - (void)setHostFd:(int)fd writeLock:(NSLock *)lock;
+
+// LAN media path. Control/input remain on the authenticated TCP socket while
+// encoded video is sent as small UDP datagrams to avoid TCP head-of-line stalls.
+// Passing port 0 clears the destination and restores the normal TCP video path.
+- (void)setLANVideoPeerAddress:(uint32_t)addressNetworkOrder
+                           port:(uint16_t)portHostOrder
+                          token:(uint64_t)token;
 
 @end

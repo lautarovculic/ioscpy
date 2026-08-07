@@ -55,7 +55,10 @@ impl UsbForward {
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| {
-                format!("couldn't start the USB link. {}", crate::platform::missing_tools_hint())
+                format!(
+                    "couldn't start the USB link. {}",
+                    crate::platform::missing_tools_hint()
+                )
             })?;
 
         let deadline = Instant::now() + Duration::from_secs(6);

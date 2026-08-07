@@ -10,6 +10,26 @@ pub struct DecodedFrame {
     pub height: usize,
 }
 
+/// Fast content fingerprint for unique-frame accounting. Sampling a bounded grid
+/// avoids hashing every pixel at high resolutions while remaining sensitive to
+/// motion across the whole screen.
+pub fn frame_fingerprint(frame: &DecodedFrame) -> u64 {
+    let mut hash = 1469598103934665603u64;
+    let rows = frame.height.min(16).max(1);
+    let cols = frame.width.min(16).max(1);
+    for gy in 0..rows {
+        let y = gy * frame.height.saturating_sub(1) / rows.saturating_sub(1).max(1);
+        for gx in 0..cols {
+            let x = gx * frame.width.saturating_sub(1) / cols.saturating_sub(1).max(1);
+            hash ^= u64::from(frame.buf[y * frame.width + x]);
+            hash = hash.wrapping_mul(1099511628211);
+        }
+    }
+    hash ^= frame.width as u64;
+    hash = hash.wrapping_mul(1099511628211);
+    hash ^ frame.height as u64
+}
+
 /// Clockwise quarter-turns needed to show a captured orientation upright
 /// (1=portrait, 2=upsideDown, 3=landscapeLeft, 4=landscapeRight). These match the
 /// device's touch-rotation labels, so display and touch stay in step.
@@ -99,4 +119,26 @@ pub fn decode_jpeg(jpeg: &[u8]) -> Option<DecodedFrame> {
 
     let buf = pack_rgb888(&pixels, width, height);
     Some(DecodedFrame { buf, width, height })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{frame_fingerprint, DecodedFrame};
+
+    #[test]
+    fn fingerprint_is_stable_and_detects_content_changes() {
+        let a = DecodedFrame {
+            buf: vec![0x00112233; 64],
+            width: 8,
+            height: 8,
+        };
+        let mut b = DecodedFrame {
+            buf: a.buf.clone(),
+            width: 8,
+            height: 8,
+        };
+        assert_eq!(frame_fingerprint(&a), frame_fingerprint(&b));
+        b.buf[63] ^= 0x00ff00;
+        assert_ne!(frame_fingerprint(&a), frame_fingerprint(&b));
+    }
 }

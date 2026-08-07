@@ -26,10 +26,9 @@ mod ffi {
     extern "C" {
         pub fn ioscpy_h264_decoder_new() -> *mut Decoder;
         pub fn ioscpy_h264_decoder_free(dec: *mut Decoder);
-        pub fn ioscpy_h264_decoder_decode(
+        pub fn ioscpy_h264_decoder_decode(dec: *mut Decoder, avcc: *const u8, len: usize) -> c_int;
+        pub fn ioscpy_h264_decoder_take(
             dec: *mut Decoder,
-            avcc: *const u8,
-            len: usize,
             out_bgra: *mut *const u8,
             out_w: *mut c_int,
             out_h: *mut c_int,
@@ -56,33 +55,31 @@ impl H264Decoder {
 
     /// Decode one AVCC frame (4-byte length-prefixed NALs, may carry SPS/PPS).
     pub fn decode(&mut self, avcc: &[u8]) -> Decoded {
+        let submitted =
+            unsafe { ffi::ioscpy_h264_decoder_decode(self.inner, avcc.as_ptr(), avcc.len()) };
+        if submitted < 0 {
+            return Decoded::Failed;
+        }
+
         let mut out_ptr: *const u8 = std::ptr::null();
         let mut w: i32 = 0;
         let mut h: i32 = 0;
-        let rc = unsafe {
-            ffi::ioscpy_h264_decoder_decode(
-                self.inner,
-                avcc.as_ptr(),
-                avcc.len(),
-                &mut out_ptr,
-                &mut w,
-                &mut h,
-            )
-        };
+        let rc = unsafe { ffi::ioscpy_h264_decoder_take(self.inner, &mut out_ptr, &mut w, &mut h) };
         match rc {
             1 if !out_ptr.is_null() && w > 0 && h > 0 => {
                 let width = w as usize;
                 let height = h as usize;
                 // the shim owns this buffer until the next decode, so copy it
                 // into a frame we own before returning
-                let bgra = unsafe { std::slice::from_raw_parts(out_ptr, width * height * 4) };
+                // VideoToolbox gives tightly packed BGRA bytes. On little-endian
+                // Apple silicon each pixel is therefore 0xAARRGGBB as a u32,
+                // exactly the layout minifb consumes (the high alpha byte is
+                // ignored). Copy whole pixels instead of rebuilding RGB one
+                // channel at a time.
+                let packed =
+                    unsafe { std::slice::from_raw_parts(out_ptr.cast::<u32>(), width * height) };
                 let mut buf = vec![0u32; width * height];
-                for (i, px) in buf.iter_mut().enumerate() {
-                    let b = bgra[i * 4] as u32;
-                    let g = bgra[i * 4 + 1] as u32;
-                    let r = bgra[i * 4 + 2] as u32;
-                    *px = (r << 16) | (g << 8) | b;
-                }
+                buf.copy_from_slice(packed);
                 Decoded::Frame(DecodedFrame { buf, width, height })
             }
             0 => Decoded::Pending,

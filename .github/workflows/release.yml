@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag matching the crate version, for example v0.2.0-dream.1
+        required: true
+        default: v0.2.0-dream.1
+        type: string
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag and package versions
+        run: |
+          CRATE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' host/Cargo.toml | head -1)"
+          DEB_VERSION="$(sed -n 's/^Version: //p' device/control | head -1)"
+          EXPECTED_TAG="v${CRATE_VERSION}"
+          test "${{ inputs.tag }}" = "$EXPECTED_TAG"
+          test "$DEB_VERSION" = "$(printf '%s' "$CRATE_VERSION" | sed 's/-/~/' )"
+          cargo fmt --manifest-path host/Cargo.toml --all -- --check
+          cargo test --manifest-path host/Cargo.toml --locked --all-targets
+
+  macos-host:
+    name: Build macOS universal host
+    needs: validate
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build --manifest-path host/Cargo.toml --release --locked --target aarch64-apple-darwin
+          cargo build --manifest-path host/Cargo.toml --release --locked --target x86_64-apple-darwin
+          mkdir -p dist/macos
+          lipo -create \
+            host/target/aarch64-apple-darwin/release/ioscpy \
+            host/target/x86_64-apple-darwin/release/ioscpy \
+            -output dist/macos/ioscpy
+          chmod +x dist/macos/ioscpy
+          codesign --force --sign - dist/macos/ioscpy
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' host/Cargo.toml | head -1)"
+          tar -czf "dist/ioscpy-${VERSION}-macos-universal.tar.gz" -C dist/macos ioscpy
+          shasum -a 256 dist/macos/ioscpy dist/*.tar.gz > dist/SHA256SUMS-macos
+          printf '{"version":"%s","commit":"%s","platform":"macos","architectures":["arm64","x86_64"]}\n' \
+            "$VERSION" "$GITHUB_SHA" > dist/build-manifest-macos.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-macos
+            dist/build-manifest-macos.json
+
+  device-package:
+    name: Build iOS ${{ matrix.scheme }} package
+    needs: validate
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: rootless
+            make_target: device-rootless
+          - scheme: rootful
+            make_target: device-rootful
+    env:
+      THEOS: ${{ github.workspace }}/.theos
+      THEOS_REVISION: 16362d3aa83a0acd56df4493d575d34306d42478
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packaging dependencies
+        run: brew install dpkg ldid xz
+      - name: Install pinned Theos
+        run: |
+          git clone --filter=blob:none https://github.com/theos/theos.git "$THEOS"
+          git -C "$THEOS" checkout --detach "$THEOS_REVISION"
+          git -C "$THEOS" submodule update --init --recursive --depth 1
+      - name: Build package
+        run: make ${{ matrix.make_target }}
+      - name: Collect package and metadata
+        run: |
+          mkdir -p "dist/${{ matrix.scheme }}"
+          find device/packages -maxdepth 1 -type f -name '*.deb' \
+            -exec cp {} "dist/${{ matrix.scheme }}/" \;
+          test -n "$(find "dist/${{ matrix.scheme }}" -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          shasum -a 256 "dist/${{ matrix.scheme }}"/*.deb \
+            > "dist/SHA256SUMS-${{ matrix.scheme }}"
+          VERSION="$(sed -n 's/^Version: //p' device/control | head -1)"
+          printf '{"version":"%s","commit":"%s","platform":"ios","scheme":"%s"}\n' \
+            "$VERSION" "$GITHUB_SHA" "${{ matrix.scheme }}" \
+            > "dist/build-manifest-${{ matrix.scheme }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-device-${{ matrix.scheme }}
+          path: |
+            dist/${{ matrix.scheme }}/*.deb
+            dist/SHA256SUMS-${{ matrix.scheme }}
+            dist/build-manifest-${{ matrix.scheme }}.json
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - macos-host
+      - device-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create aggregate checksums
+        run: |
+          find dist -type f ! -name 'SHA256SUMS*' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > dist/SHA256SUMS
+          find dist -type f -maxdepth 3 -print
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=("$TAG" --title "ioscpy Dream ${TAG#v}" --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          while IFS= read -r -d '' file; do
+            args+=("$file")
+          done < <(find dist -type f -print0)
+          gh release create "${args[@]}"

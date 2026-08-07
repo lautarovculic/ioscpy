@@ -1,6 +1,6 @@
 // Fast full-screen capture. The render server blits the live display into an
-// IOSurface on the GPU; we then downscale cheaply and JPEG-encode. Works on
-// whatever screen the device has. Size and scale are read at runtime.
+// IOSurface; H.264 frames use pooled surfaces and VideoToolbox pixel transfer
+// for hardware scaling, while the MJPEG fallback uses CoreGraphics/ImageIO.
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -14,11 +14,15 @@ extern "C" {
 BOOL IOSPYCaptureAvailable(void);
 
 // Capture the screen, downscaled (longest side capped by maxDimension, 0 =
-// native), into a reusable BGRA IOSurface with even dimensions (the H.264
-// encoder needs even width/height). Writes the surface size to outWidth/outHeight
-// and returns the surface (owned internally, valid until the next call) or NULL.
-// Safe to call off the main thread.
-IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int *outHeight);
+// native), into a pooled BGRA IOSurface with even dimensions. `outToken` receives
+// the pool slot that must be returned with IOSPYReleaseCaptureSurface after the
+// asynchronous encoder has finished reading it. Returns NULL with token -1 when
+// no slot is available or capture fails. Safe to call off the main thread.
+IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int *outHeight,
+                                       int *outToken);
+
+// Return a surface acquired by IOSPYCaptureScreenSurface to the two-frame pool.
+void IOSPYReleaseCaptureSurface(int token);
 
 // Capture the current screen as JPEG. maxDimension caps the longest side
 // (0 = native), quality runs 0.0 to 1.0. Writes the encoded pixel size to

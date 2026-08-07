@@ -1,150 +1,197 @@
-//! Right-side button panel mirroring the existing keyboard shortcuts. minifb
-//! has no native widgets, so the panel is pixels drawn straight into the
-//! window buffer; this module only knows geometry and drawing, not how to
-//! send input (that stays in `window.rs`, next to the keyboard handlers it
-//! mirrors).
-//!
-//! Icons are PNGs under `assets/icons/`, traced from the Lucide icon set
-//! (https://lucide.dev, ISC license), embedded with `include_bytes!` and
-//! decoded once, lazily, on first draw (see `icon_for`). To change an icon,
-//! replace its PNG and rebuild — nothing else in this file needs to change.
+//! Apple-style hover toolbar for device controls. The original permanent
+//! right-side strip consumed screen space and made the mirror look like a debug
+//! utility. The replacement appears only near the top edge and keeps the phone
+//! frame unobstructed the rest of the time.
 
 use std::io::Cursor;
 use std::sync::OnceLock;
 
-/// Sidebar width in window points, before backing-scale.
-pub const WIDTH: usize = 56;
-
-const ROWS: usize = 10;
+pub const HOVER_ZONE: f32 = 76.0;
+const TOP: f32 = 10.0;
+const OUTER_PAD: f32 = 7.0;
+const BUTTON: f32 = 40.0;
+const GAP: f32 = 7.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    Home,
-    Lock,
     AppSwitcher,
-    Rotate,
-    Back,
-    SelectAll,
-    Copy,
-    Paste,
-    Cut,
-    Undo,
+    Home,
 }
 
-/// Top group is the device actions (Home/Back/App Switcher first, then
-/// Lock/Rotate); bottom group mirrors Cmd/Ctrl+A/C/V/X/Z.
-pub const BUTTONS: [Action; ROWS] = [
-    Action::Home,
-    Action::Back,
-    Action::AppSwitcher,
-    Action::Lock,
-    Action::Rotate,
-    Action::SelectAll,
-    Action::Copy,
-    Action::Paste,
-    Action::Cut,
-    Action::Undo,
-];
+pub const BUTTONS: [Action; 2] = [Action::AppSwitcher, Action::Home];
 
-/// Which button, if any, contains the point `(x, y)` local to the sidebar
-/// (`x` in `[0, WIDTH)`, `y` in `[0, height)`, both in window points).
-pub fn hit_test(x: f32, y: f32, height: f32) -> Option<usize> {
-    if x < 0.0 || x >= WIDTH as f32 || y < 0.0 || y >= height {
+fn toolbar_width() -> f32 {
+    OUTER_PAD * 2.0 + BUTTON * BUTTONS.len() as f32 + GAP * (BUTTONS.len() - 1) as f32
+}
+
+fn toolbar_height() -> f32 {
+    OUTER_PAD * 2.0 + BUTTON
+}
+
+fn bounds(window_w: f32) -> (f32, f32, f32, f32) {
+    let w = toolbar_width();
+    ((window_w - w - 12.0).max(8.0), TOP, w, toolbar_height())
+}
+
+pub fn hit_test(x: f32, y: f32, window_w: f32) -> Option<usize> {
+    let (left, top, width, height) = bounds(window_w);
+    if x < left || x >= left + width || y < top || y >= top + height {
         return None;
     }
-    let row_h = height / ROWS as f32;
-    let idx = (y / row_h) as usize;
-    (idx < ROWS).then_some(idx)
-}
-
-const BG: u32 = 0x00_24_24_24;
-const BTN: u32 = 0x00_3a_3a_3a;
-const BTN_PRESSED: u32 = 0x00_55_55_55;
-const ICON_COLOR: u32 = 0x00_e6_e6_e6;
-const DIVIDER: u32 = 0x00_18_18_18;
-
-/// Render the sidebar into the row `[x_off, x_off + w)` of `buf`, a
-/// `stride`-wide by `h`-tall buffer that also holds the device frame next to
-/// it. `w` is the sidebar's on-screen width (already scaled to match the
-/// content buffer it sits beside). `pressed` highlights the button currently
-/// held down, if any.
-pub fn draw_into(buf: &mut [u32], stride: usize, x_off: usize, w: usize, h: usize, pressed: Option<usize>) {
-    if w == 0 || h == 0 {
-        return;
-    }
-    for y in 0..h {
-        let row = y * stride + x_off;
-        for x in 0..w {
-            buf[row + x] = BG;
+    for index in 0..BUTTONS.len() {
+        let x0 = left + OUTER_PAD + index as f32 * (BUTTON + GAP);
+        let y0 = top + OUTER_PAD;
+        if x >= x0 && x < x0 + BUTTON && y >= y0 && y < y0 + BUTTON {
+            return Some(index);
         }
     }
-    let row_h = h as f32 / ROWS as f32;
-    for (i, action) in BUTTONS.iter().enumerate() {
-        let y0 = (i as f32 * row_h) as usize;
-        let y1 = (((i + 1) as f32 * row_h) as usize).min(h);
-        let color = if Some(i) == pressed { BTN_PRESSED } else { BTN };
-        for y in y0..y1 {
-            let row = y * stride + x_off;
-            for x in 1..w.saturating_sub(1) {
-                buf[row + x] = color;
+    None
+}
+
+/// Draw the toolbar over an already rendered frame. `point_scale` converts
+/// window points to pixels in the source canvas handed to minifb.
+pub fn draw_into(
+    buf: &mut [u32],
+    stride: usize,
+    width: usize,
+    height: usize,
+    point_scale: f32,
+    pressed: Option<usize>,
+) {
+    if width == 0 || height == 0 || point_scale <= 0.0 {
+        return;
+    }
+    let window_w = width as f32 / point_scale;
+    let (left, top, toolbar_w, toolbar_h) = bounds(window_w);
+    let x0 = (left * point_scale).round().max(0.0) as usize;
+    let y0 = (top * point_scale).round().max(0.0) as usize;
+    let x1 = ((left + toolbar_w) * point_scale).round().min(width as f32) as usize;
+    let y1 = ((top + toolbar_h) * point_scale).round().min(height as f32) as usize;
+    let radius = (16.0 * point_scale).max(1.0) as usize;
+    fill_round_rect(
+        buf, stride, width, height, x0, y0, x1, y1, radius, 0x001b1b1d, 218,
+    );
+
+    for (index, action) in BUTTONS.iter().enumerate() {
+        let bx0 =
+            ((left + OUTER_PAD + index as f32 * (BUTTON + GAP)) * point_scale).round() as usize;
+        let by0 = ((top + OUTER_PAD) * point_scale).round() as usize;
+        let bx1 = ((left + OUTER_PAD + index as f32 * (BUTTON + GAP) + BUTTON) * point_scale)
+            .round() as usize;
+        let by1 = ((top + OUTER_PAD + BUTTON) * point_scale).round() as usize;
+        let color = if pressed == Some(index) {
+            0x005f6064
+        } else {
+            0x00353639
+        };
+        fill_round_rect(
+            buf,
+            stride,
+            width,
+            height,
+            bx0,
+            by0,
+            bx1,
+            by1,
+            (11.0 * point_scale).max(1.0) as usize,
+            color,
+            235,
+        );
+        draw_icon(buf, stride, width, height, bx0, by0, bx1, by1, *action);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_round_rect(
+    buf: &mut [u32],
+    stride: usize,
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    radius: usize,
+    color: u32,
+    alpha: u8,
+) {
+    let x1 = x1.min(width);
+    let y1 = y1.min(height);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let r = radius.min((x1 - x0) / 2).min((y1 - y0) / 2);
+    let rr = (r * r) as isize;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = if x < x0 + r {
+                (x0 + r - x) as isize
+            } else if x >= x1.saturating_sub(r) {
+                (x - (x1 - r - 1)) as isize
+            } else {
+                0
+            };
+            let dy = if y < y0 + r {
+                (y0 + r - y) as isize
+            } else if y >= y1.saturating_sub(r) {
+                (y - (y1 - r - 1)) as isize
+            } else {
+                0
+            };
+            if dx == 0 || dy == 0 || dx * dx + dy * dy <= rr {
+                let px = &mut buf[y * stride + x];
+                *px = blend_toward(*px, color, alpha);
             }
         }
-        draw_icon(buf, stride, x_off, w, *action, y0, y1);
-    }
-    // Separator between the device-action group and the editing group.
-    let sep_y = ((5.0 * row_h) as usize).min(h.saturating_sub(1));
-    let row = sep_y * stride + x_off;
-    for x in 0..w {
-        buf[row + x] = DIVIDER;
     }
 }
 
-/// Nearest-neighbor sample the icon's alpha channel into the `[y0, y1)` row
-/// of the button at column range `[0, w)`, alpha-blending each covered pixel
-/// toward `ICON_COLOR` so anti-aliased edges from the source PNG carry over
-/// instead of hard-thresholding to on/off.
-fn draw_icon(buf: &mut [u32], stride: usize, x_off: usize, w: usize, action: Action, y0: usize, y1: usize) {
+#[allow(clippy::too_many_arguments)]
+fn draw_icon(
+    buf: &mut [u32],
+    stride: usize,
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    action: Action,
+) {
     let icon = icon_for(action);
-    let size = (((y1 - y0).min(w) as f32) * 0.7) as usize;
-    if size == 0 {
-        return;
-    }
-    let local_x_off = w.saturating_sub(size) / 2;
-    let y_off = y0 + (y1 - y0).saturating_sub(size) / 2;
+    let box_w = x1.saturating_sub(x0);
+    let box_h = y1.saturating_sub(y0);
+    let size = (box_w.min(box_h) as f32 * 0.53).round().max(1.0) as usize;
+    let ox = x0 + box_w.saturating_sub(size) / 2;
+    let oy = y0 + box_h.saturating_sub(size) / 2;
     for dy in 0..size {
-        let sy = (dy * icon.h / size).min(icon.h - 1);
-        let py = y_off + dy;
-        if py >= y1 {
+        let py = oy + dy;
+        if py >= height {
             continue;
         }
+        let sy = (dy * icon.h / size).min(icon.h - 1);
         for dx in 0..size {
+            let px = ox + dx;
+            if px >= width {
+                continue;
+            }
             let sx = (dx * icon.w / size).min(icon.w - 1);
-            let a = icon.rgba[(sy * icon.w + sx) * 4 + 3];
-            if a == 0 {
-                continue;
+            let alpha = icon.rgba[(sy * icon.w + sx) * 4 + 3];
+            if alpha != 0 {
+                let dst = &mut buf[py * stride + px];
+                *dst = blend_toward(*dst, 0x00f4f4f5, alpha);
             }
-            let px = local_x_off + dx;
-            if px >= w {
-                continue;
-            }
-            let dst = &mut buf[py * stride + x_off + px];
-            *dst = blend_toward(*dst, ICON_COLOR, a);
         }
     }
 }
 
-/// Linear blend of `bg` toward `fg` by `alpha` (0 = `bg`, 255 = `fg`), per
-/// `0x00RRGGBB` channel.
 fn blend_toward(bg: u32, fg: u32, alpha: u8) -> u32 {
     let a = alpha as u32;
     let mut out = 0u32;
-    let mut shift = 0;
-    while shift <= 16 {
+    for shift in [0, 8, 16] {
         let bg_c = (bg >> shift) & 0xff;
         let fg_c = (fg >> shift) & 0xff;
-        let v = (bg_c * (255 - a) + fg_c * a) / 255;
-        out |= v << shift;
-        shift += 8;
+        out |= ((bg_c * (255 - a) + fg_c * a) / 255) << shift;
     }
     out
 }
@@ -155,55 +202,32 @@ struct IconImage {
     rgba: Vec<u8>,
 }
 
-fn decode_icon(png_bytes: &[u8]) -> IconImage {
-    let decoder = png::Decoder::new(Cursor::new(png_bytes));
-    let mut reader = decoder.read_info().expect("bundled icon PNG is well-formed");
-    let mut buf = vec![0u8; reader.output_buffer_size().expect("bundled icon PNG has a known size")];
-    let info = reader.next_frame(&mut buf).expect("bundled icon PNG decodes");
-    buf.truncate(info.buffer_size());
-    IconImage { w: info.width as usize, h: info.height as usize, rgba: buf }
+fn decode_icon(bytes: &[u8]) -> IconImage {
+    let decoder = png::Decoder::new(Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("bundled icon is valid PNG");
+    let mut rgba = vec![0; reader.output_buffer_size().expect("known icon size")];
+    let info = reader.next_frame(&mut rgba).expect("bundled icon decodes");
+    rgba.truncate(info.buffer_size());
+    IconImage {
+        w: info.width as usize,
+        h: info.height as usize,
+        rgba,
+    }
 }
 
-struct IconSet {
+struct Icons {
     home: IconImage,
-    lock: IconImage,
     app_switcher: IconImage,
-    rotate: IconImage,
-    back: IconImage,
-    select_all: IconImage,
-    copy: IconImage,
-    paste: IconImage,
-    cut: IconImage,
-    undo: IconImage,
 }
 
-/// Decodes all ten bundled icons once, on first sidebar draw, and keeps them
-/// around for the life of the process. Looked up by name (not array index)
-/// so the mapping survives `Action` or `BUTTONS` being reordered.
 fn icon_for(action: Action) -> &'static IconImage {
-    static ICONS: OnceLock<IconSet> = OnceLock::new();
-    let icons = ICONS.get_or_init(|| IconSet {
+    static ICONS: OnceLock<Icons> = OnceLock::new();
+    let icons = ICONS.get_or_init(|| Icons {
         home: decode_icon(include_bytes!("../assets/icons/home.png")),
-        lock: decode_icon(include_bytes!("../assets/icons/lock.png")),
         app_switcher: decode_icon(include_bytes!("../assets/icons/appswitcher.png")),
-        rotate: decode_icon(include_bytes!("../assets/icons/rotate.png")),
-        back: decode_icon(include_bytes!("../assets/icons/back.png")),
-        select_all: decode_icon(include_bytes!("../assets/icons/selectall.png")),
-        copy: decode_icon(include_bytes!("../assets/icons/copy.png")),
-        paste: decode_icon(include_bytes!("../assets/icons/paste.png")),
-        cut: decode_icon(include_bytes!("../assets/icons/cut.png")),
-        undo: decode_icon(include_bytes!("../assets/icons/undo.png")),
     });
     match action {
         Action::Home => &icons.home,
-        Action::Lock => &icons.lock,
         Action::AppSwitcher => &icons.app_switcher,
-        Action::Rotate => &icons.rotate,
-        Action::Back => &icons.back,
-        Action::SelectAll => &icons.select_all,
-        Action::Copy => &icons.copy,
-        Action::Paste => &icons.paste,
-        Action::Cut => &icons.cut,
-        Action::Undo => &icons.undo,
     }
 }

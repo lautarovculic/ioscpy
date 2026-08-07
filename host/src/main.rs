@@ -26,17 +26,151 @@ mod wayland_compat;
 mod window;
 
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, StreamProfile};
+use crate::config::VideoSettings;
 
 const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Serialize)]
+struct BenchReport {
+    elapsed_seconds: f64,
+    codec: String,
+    width: u32,
+    height: u32,
+    received_frames: u64,
+    decoded_frames: u64,
+    unique_decoded_frames: u64,
+    keyframes: u64,
+    received_fps: f64,
+    unique_fps: f64,
+    bytes: u64,
+    average_kilobytes_per_frame: f64,
+    megabytes_per_second: f64,
+    read_milliseconds_per_frame: f64,
+    decode_milliseconds_per_frame: f64,
+    stream_config: protocol::StreamConfig,
+    device: Option<protocol::DeviceStreamStats>,
+}
+
+fn pair_token(cli: &Cli) -> Result<Option<String>> {
+    let token = if let Some(path) = cli.pair_token_file.as_deref() {
+        Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("could not read LAN pairing token from {path}"))?,
+        )
+    } else {
+        std::env::var("IOSCPY_PAIR_TOKEN").ok()
+    };
+    match token {
+        Some(token) => {
+            let token = token.trim().to_string();
+            if token.len() < 16 {
+                bail!("LAN pairing token must contain at least 16 characters");
+            }
+            Ok(Some(token))
+        }
+        None => Ok(None),
+    }
+}
+
+fn stream_config(cli: &Cli, codec: u8) -> protocol::StreamConfig {
+    use protocol::{LatencyMode, StreamConfig};
+
+    let mut config = match cli.profile.unwrap_or(StreamProfile::Legacy) {
+        StreamProfile::Legacy => StreamConfig::legacy(codec),
+        StreamProfile::Quality => StreamConfig {
+            codec,
+            target_fps: 60,
+            max_dimension: 2160,
+            latency_mode: LatencyMode::Quality,
+            bitrate_bps: 25_000_000,
+            keyframe_interval_frames: 120,
+        },
+        StreamProfile::Balanced => StreamConfig {
+            codec,
+            target_fps: 60,
+            max_dimension: 1800,
+            latency_mode: LatencyMode::Balanced,
+            bitrate_bps: 16_000_000,
+            keyframe_interval_frames: 120,
+        },
+        StreamProfile::Latency => StreamConfig {
+            codec,
+            target_fps: 60,
+            max_dimension: 1280,
+            latency_mode: LatencyMode::LowLatency,
+            bitrate_bps: 8_000_000,
+            keyframe_interval_frames: 120,
+        },
+        StreamProfile::HighRefresh => StreamConfig {
+            codec,
+            target_fps: 90,
+            max_dimension: 1600,
+            latency_mode: LatencyMode::HighRefresh,
+            bitrate_bps: 18_000_000,
+            keyframe_interval_frames: 180,
+        },
+    };
+
+    if let Some(fps) = cli.fps {
+        config.target_fps = fps;
+    }
+    if config.target_fps >= 120 && cli.max_dimension.is_none() {
+        // FPS and image quality are independent controls. Never silently reduce
+        // resolution because the user selected 120 FPS; let device telemetry
+        // expose the actual limit instead.
+        config.max_dimension = config.max_dimension.max(2160);
+        config.bitrate_bps = config.bitrate_bps.max(40_000_000);
+        config.keyframe_interval_frames = 120;
+        config.latency_mode = LatencyMode::Quality;
+    }
+    if let Some(max_dimension) = cli.max_dimension {
+        config.max_dimension = max_dimension;
+    }
+    if let Some(mbps) = cli.bitrate_mbps {
+        config.bitrate_bps = mbps.saturating_mul(1_000_000);
+    }
+    let keyframe_seconds = cli.keyframe_seconds.unwrap_or_else(|| {
+        (u32::from(config.keyframe_interval_frames) / u32::from(config.target_fps.max(1))).max(1)
+            as u16
+    });
+    config.keyframe_interval_frames = u32::from(config.target_fps)
+        .saturating_mul(u32::from(keyframe_seconds))
+        .min(u32::from(u16::MAX)) as u16;
+    config
+}
+
+fn cli_has_video_overrides(cli: &Cli) -> bool {
+    cli.profile.is_some()
+        || cli.fps.is_some()
+        || cli.max_dimension.is_some()
+        || cli.bitrate_mbps.is_some()
+        || cli.keyframe_seconds.is_some()
+}
+
+fn initial_video_settings(cli: &Cli) -> VideoSettings {
+    if !cli_has_video_overrides(cli) {
+        return VideoSettings::load();
+    }
+    let cfg = stream_config(cli, protocol::VIDEO_CODEC_H264);
+    VideoSettings {
+        target_fps: cfg.target_fps,
+        max_dimension: cfg.max_dimension,
+        bitrate_mbps: cfg.bitrate_bps / 1_000_000,
+        keyframe_seconds: (cfg.keyframe_interval_frames / cfg.target_fps.max(1)).max(1),
+        latency_mode: cfg.latency_mode,
+    }
+    .sanitized()
+}
 
 fn main() {
     let cli = Cli::parse_args();
@@ -102,7 +236,7 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
 
     // Handshake-only diagnostic path, no window.
     if cli.handshake_only {
-        return run_connection_loop(cli, port, &stop, None, None, None);
+        return run_connection_loop(cli, port, &stop, None, None, None, None, None);
     }
 
     // Grab one frame for testing the stream path.
@@ -132,7 +266,7 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
         }
         println!("soak: running the streaming session for {secs}s, watching for reconnects…");
         let slot = window::new_frame_slot();
-        return run_connection_loop(cli, port, &stop, Some(slot), None, None);
+        return run_connection_loop(cli, port, &stop, Some(slot), None, None, None, None);
     }
 
     // Set the Dock icon on the main thread before the window opens, otherwise the
@@ -141,12 +275,16 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
 
     let slot = window::new_frame_slot();
     let (input_tx, input_rx) = mpsc::channel::<input::InputFrame>();
+    let video_settings = Arc::new(Mutex::new(initial_video_settings(cli)));
+    let active_codec = Arc::new(AtomicU8::new(protocol::VIDEO_CODEC_H264));
     // iPhone to Mac clipboard text goes from the net thread to the window thread,
     // which owns the pasteboard (and the main thread).
     let (clip_in_tx, clip_in_rx) = mpsc::channel::<String>();
     let net_slot = slot.clone();
     let net_stop = stop.clone();
     let net_cli = cli.clone();
+    let net_settings = video_settings.clone();
+    let net_codec = active_codec.clone();
     let net = thread::spawn(move || {
         if let Err(e) = run_connection_loop(
             &net_cli,
@@ -155,6 +293,8 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
             Some(net_slot),
             Some(input_rx),
             Some(clip_in_tx),
+            Some(&net_settings),
+            Some(&net_codec),
         ) {
             eprintln!("ioscpy: error: {e:#}");
         }
@@ -162,7 +302,16 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
     });
 
     let window_title = format!("ioscpy v{HOST_VERSION}");
-    let result = window::run_window(&window_title, slot, stop.clone(), input_tx, clip_in_rx);
+    let result = window::run_window(
+        &window_title,
+        slot,
+        stop.clone(),
+        input_tx,
+        clip_in_rx,
+        video_settings,
+        active_codec,
+        cli.input_debug,
+    );
     stop.store(true, Ordering::Relaxed);
     let _ = net.join();
     result
@@ -178,7 +327,10 @@ fn run_connection_loop(
     frame_sink: Option<window::FrameSlot>,
     input_rx: Option<mpsc::Receiver<input::InputFrame>>,
     clip_in: Option<mpsc::Sender<String>>,
+    runtime_settings: Option<&Arc<Mutex<VideoSettings>>>,
+    active_codec: Option<&Arc<AtomicU8>>,
 ) -> Result<()> {
+    let pair_token = pair_token(cli)?;
     let mut first = true;
     while !stop.load(Ordering::Relaxed) {
         // The forward has to outlive the session, so keep it in scope here.
@@ -204,7 +356,7 @@ fn run_connection_loop(
         stream.set_read_timeout(Some(Duration::from_secs(8))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(8))).ok();
 
-        let ack = match protocol::handshake(&mut stream, HOST_VERSION) {
+        let ack = match protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref()) {
             Ok(ack) => ack,
             Err(e) => {
                 if cli.addr.is_some() {
@@ -249,6 +401,21 @@ fn run_connection_loop(
         } else {
             protocol::VIDEO_CODEC_MJPEG
         };
+        if let Some(active_codec) = active_codec {
+            active_codec.store(codec, Ordering::Relaxed);
+        }
+        let stream_config = runtime_settings
+            .and_then(|settings| settings.lock().ok().map(|value| value.stream_config(codec)))
+            .unwrap_or_else(|| stream_config(cli, codec));
+        debug!(
+            "stream config: codec={} fps={} max={} bitrate={} keyint={} mode={:?}",
+            stream_config.codec,
+            stream_config.target_fps,
+            stream_config.max_dimension,
+            stream_config.bitrate_bps,
+            stream_config.keyframe_interval_frames,
+            stream_config.latency_mode,
+        );
 
         // Only hide the device keyboard if asked and the tweak can do it.
         let suppress_keyboard = cli.no_keyboard && ack.capabilities.keyboard;
@@ -259,8 +426,9 @@ fn run_connection_loop(
             frame_sink.clone(),
             input_rx.as_ref(),
             clip_in.as_ref(),
-            codec,
+            stream_config,
             suppress_keyboard,
+            cli.input_debug,
         )? {
             health::SessionEnd::Quit => break,
             health::SessionEnd::Lost => {
@@ -283,19 +451,21 @@ fn cmd_snapshot(cli: &Cli, port: u16, path: &str) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(8))).ok();
 
-    let ack =
-        protocol::handshake(&mut stream, HOST_VERSION).context("handshake with ioscpyd failed")?;
+    let pair_token = pair_token(cli)?;
+    let ack = protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref())
+        .context("handshake with ioscpyd failed")?;
     health::print_capabilities(&ack);
     if ack.capabilities.stream_backends.is_empty() {
         warn!("the phone side isn't fully up yet, so the screen might not show. Respring the phone (or reinstall ioscpy from Sileo) and reconnect.");
     }
 
+    let snapshot_config = stream_config(cli, protocol::VIDEO_CODEC_MJPEG).encode();
     protocol::write_frame(
         &mut stream,
         protocol::MessageType::StartStream,
         protocol::CHANNEL_CONTROL,
         0,
-        &[],
+        &snapshot_config,
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -329,8 +499,9 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
-    let ack =
-        protocol::handshake(&mut stream, HOST_VERSION).context("handshake with ioscpyd failed")?;
+    let pair_token = pair_token(cli)?;
+    let ack = protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref())
+        .context("handshake with ioscpyd failed")?;
     if ack.capabilities.stream_backends.is_empty() {
         warn!("the phone side isn't fully up yet, so the screen might not show. Respring the phone (or reinstall ioscpy from Sileo) and reconnect.");
     }
@@ -339,20 +510,26 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     } else {
         protocol::VIDEO_CODEC_MJPEG
     };
+    let bench_config = stream_config(cli, codec);
     println!(
-        "bench: requesting {} stream",
+        "bench: requesting {} stream, {} fps, max {}, {:.1} Mbps, {:?}",
         if codec == protocol::VIDEO_CODEC_H264 {
             "h264"
         } else {
             "mjpeg"
-        }
+        },
+        bench_config.target_fps,
+        bench_config.max_dimension,
+        bench_config.bitrate_bps as f64 / 1_000_000.0,
+        bench_config.latency_mode,
     );
+    let start_payload = bench_config.encode();
     protocol::write_frame(
         &mut stream,
         protocol::MessageType::StartStream,
         protocol::CHANNEL_CONTROL,
         0,
-        &[codec],
+        &start_payload,
     )?;
     // Ask for a keyframe so H.264 decodes from the first frame.
     let _ = protocol::write_frame(
@@ -365,12 +542,14 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
 
     let start = Instant::now();
     let window = Duration::from_secs(secs);
-    let (mut frames, mut bytes, mut decoded, mut h264_frames, mut keyframes) =
-        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut frames, mut bytes, mut decoded, mut unique_decoded, mut h264_frames, mut keyframes) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut decode_total = Duration::ZERO;
     let mut read_total = Duration::ZERO;
     let (mut w, mut h) = (0u32, 0u32);
     let mut h264_dec: Option<h264::H264Decoder> = None;
+    let mut last_device_stats: Option<protocol::DeviceStreamStats> = None;
+    let mut last_fingerprint: Option<u64> = None;
 
     while start.elapsed() < window {
         let rt = Instant::now();
@@ -396,17 +575,32 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
                         if let h264::Decoded::Frame(f) = d.decode(data) {
                             decode_total += t.elapsed();
                             decoded += 1;
+                            let fingerprint = video::frame_fingerprint(&f);
+                            if last_fingerprint != Some(fingerprint) {
+                                unique_decoded += 1;
+                                last_fingerprint = Some(fingerprint);
+                            }
                             (w, h) = (f.width as u32, f.height as u32);
                         }
                     }
                 } else {
                     // MJPEG frame: decode to check it's valid and time it.
                     let t = Instant::now();
-                    if video::decode_jpeg(data).is_some() {
+                    if let Some(f) = video::decode_jpeg(data) {
                         decode_total += t.elapsed();
                         decoded += 1;
+                        let fingerprint = video::frame_fingerprint(&f);
+                        if last_fingerprint != Some(fingerprint) {
+                            unique_decoded += 1;
+                            last_fingerprint = Some(fingerprint);
+                        }
                     }
                 }
+            }
+        } else if frame.message_type() == Some(protocol::MessageType::Stats) {
+            if let Ok(stats) = serde_json::from_slice::<protocol::DeviceStreamStats>(&frame.payload)
+            {
+                last_device_stats = Some(stats);
             }
         }
     }
@@ -421,9 +615,36 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     let elapsed = start.elapsed().as_secs_f64();
     let n = frames.max(1) as f64;
     let kind = if h264_frames > 0 { "h264" } else { "mjpeg" };
+    let report = BenchReport {
+        elapsed_seconds: elapsed,
+        codec: kind.to_string(),
+        width: w,
+        height: h,
+        received_frames: frames,
+        decoded_frames: decoded,
+        unique_decoded_frames: unique_decoded,
+        keyframes,
+        received_fps: frames as f64 / elapsed.max(f64::EPSILON),
+        unique_fps: unique_decoded as f64 / elapsed.max(f64::EPSILON),
+        bytes,
+        average_kilobytes_per_frame: bytes as f64 / n / 1024.0,
+        megabytes_per_second: bytes as f64 / elapsed.max(f64::EPSILON) / 1024.0 / 1024.0,
+        read_milliseconds_per_frame: read_total.as_secs_f64() * 1000.0 / n,
+        decode_milliseconds_per_frame: if decoded > 0 {
+            decode_total.as_secs_f64() * 1000.0 / decoded as f64
+        } else {
+            0.0
+        },
+        stream_config: bench_config,
+        device: last_device_stats,
+    };
     println!(
         "bench: {frames} {kind} frames in {elapsed:.1}s = {:.1} fps",
         frames as f64 / elapsed
+    );
+    println!(
+        "  decoded {decoded}, unique {unique_decoded} = {:.1} unique fps",
+        unique_decoded as f64 / elapsed.max(f64::EPSILON)
     );
     println!(
         "  {w}x{h}, avg {:.1} KB/frame, ~{:.2} MB/s over the wire",
@@ -440,6 +661,16 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
             decode_total.as_secs_f64() * 1000.0 / decoded as f64
         );
     }
+    if let Some(path) = cli.bench_json.as_deref() {
+        let json = serde_json::to_string_pretty(&report)?;
+        if path == "-" {
+            println!("{json}");
+        } else {
+            std::fs::write(path, json)
+                .with_context(|| format!("could not write benchmark JSON to {path}"))?;
+            println!("  benchmark JSON: {path}");
+        }
+    }
     Ok(())
 }
 
@@ -451,14 +682,17 @@ fn cmd_action(cli: &Cli, port: u16, code: u16) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(6))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(6))).ok();
 
-    let ack = protocol::handshake(&mut stream, HOST_VERSION).context("handshake failed")?;
+    let pair_token = pair_token(cli)?;
+    let ack = protocol::handshake(&mut stream, HOST_VERSION, pair_token.as_deref())
+        .context("handshake failed")?;
     println!("input backends: {:?}", ack.capabilities.input_backends);
+    let action_config = stream_config(cli, protocol::VIDEO_CODEC_MJPEG).encode();
     protocol::write_frame(
         &mut stream,
         protocol::MessageType::StartStream,
         protocol::CHANNEL_CONTROL,
         0,
-        &[],
+        &action_config,
     )?;
 
     // Warm up: count frames for about 2s.
@@ -576,4 +810,51 @@ fn print_debug_header(cli: &Cli) {
             .or_else(|| cli.device.clone())
             .unwrap_or_else(|| "auto (single attached device)".to_string())
     );
+}
+
+#[cfg(test)]
+mod stream_profile_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("test CLI should parse")
+    }
+
+    #[test]
+    fn balanced_profile_preserves_readable_resolution() {
+        let cli = parse(&["ioscpy", "--profile", "balanced"]);
+        let config = stream_config(&cli, protocol::VIDEO_CODEC_H264);
+        assert_eq!(config.target_fps, 60);
+        assert_eq!(config.max_dimension, 1800);
+        assert_eq!(config.bitrate_bps, 16_000_000);
+    }
+
+    #[test]
+    fn high_refresh_120_uses_new_quality_floor() {
+        let cli = parse(&["ioscpy", "--profile", "high-refresh", "--fps", "120"]);
+        let config = stream_config(&cli, protocol::VIDEO_CODEC_H264);
+        assert_eq!(config.target_fps, 120);
+        assert_eq!(config.max_dimension, 2160);
+        assert_eq!(config.bitrate_bps, 40_000_000);
+        assert_eq!(config.latency_mode, protocol::LatencyMode::Quality);
+    }
+
+    #[test]
+    fn explicit_high_refresh_resolution_is_respected() {
+        let cli = parse(&[
+            "ioscpy",
+            "--profile",
+            "high-refresh",
+            "--fps",
+            "120",
+            "--max-dimension",
+            "1920",
+            "--bitrate-mbps",
+            "30",
+        ]);
+        let config = stream_config(&cli, protocol::VIDEO_CODEC_H264);
+        assert_eq!(config.max_dimension, 1920);
+        assert_eq!(config.bitrate_bps, 30_000_000);
+    }
 }

@@ -16,6 +16,9 @@
 
 extern char **environ;
 
+static NSString *const kLanConfigPath = @"/var/mobile/Library/Preferences/com.ioscpy.lan.plist";
+static NSString *const kTrustPath = @"/var/mobile/Library/Preferences/com.ioscpy.trust.plist";
+
 static int connectLoopback(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -41,7 +44,7 @@ static NSDictionary *fetchHandshake(uint16_t port) {
     }
     NSDictionary *hello = @{
         @"role": @"ctl",
-        @"host_version": @"0.1.5",
+        @"host_version": @"0.3.0-dream.9",
         @"protocol_version": @(IOSPY_PROTOCOL_VERSION),
         @"nonce": @"00",
     };
@@ -52,6 +55,37 @@ static NSDictionary *fetchHandshake(uint16_t port) {
         NSData *payload = nil;
         if (IOSPYReadFrame(fd, &hdr, &payload) && hdr.type == IOSPYMsgHelloAck) {
             result = [NSJSONSerialization JSONObjectWithData:payload options:0 error:nil];
+        }
+    }
+    close(fd);
+    return result;
+}
+
+static int sendPrivilegedMessage(IOSPYMessageType type, NSData *commandPayload) {
+    int fd = connectLoopback(IOSPY_DEFAULT_PORT);
+    if (fd < 0) return 1;
+    NSDictionary *hello = @{
+        @"role": @"ctl",
+        @"host_version": @"0.3.0-dream.9",
+        @"protocol_version": @(IOSPY_PROTOCOL_VERSION),
+        @"nonce": @"00",
+    };
+    NSData *helloData = [NSJSONSerialization dataWithJSONObject:hello options:0 error:nil];
+    int result = 1;
+    if (IOSPYWriteFrame(fd, IOSPYMsgHello, IOSPY_CHANNEL_CONTROL, 0, helloData)) {
+        IOSPYFrameHeader header;
+        NSData *ackData = nil;
+        if (IOSPYReadFrame(fd, &header, &ackData) && header.type == IOSPYMsgHelloAck) {
+            NSDictionary *ack = [NSJSONSerialization JSONObjectWithData:ackData options:0 error:nil];
+            NSString *token = [ack[@"session_token"] isKindOfClass:[NSString class]]
+                ? ack[@"session_token"] : nil;
+            NSData *tokenData = [token dataUsingEncoding:NSUTF8StringEncoding];
+            if (tokenData.length > 0 &&
+                IOSPYWriteFrame(fd, IOSPYMsgAuthenticate, IOSPY_CHANNEL_CONTROL, 1, tokenData) &&
+                IOSPYWriteFrame(fd, type, IOSPY_CHANNEL_CONTROL, 2,
+                                commandPayload ?: [NSData data])) {
+                result = 0;
+            }
         }
     }
     close(fd);
@@ -155,6 +189,68 @@ static int cmdExportDiagnostics(void) {
     return rc;
 }
 
+static int cmdLanEnable(NSString *bindAddress) {
+    struct in_addr parsed;
+    if (inet_pton(AF_INET, bindAddress.UTF8String, &parsed) != 1 ||
+        [bindAddress isEqualToString:@"127.0.0.1"]) {
+        fprintf(stderr, "lan-enable requires a non-loopback IPv4 bind address\n");
+        return 2;
+    }
+    NSDictionary *config = @{@"BindAddress": bindAddress};
+    if (![config writeToFile:kLanConfigPath atomically:YES]) {
+        fprintf(stderr, "could not write %s\n", kLanConfigPath.UTF8String);
+        return 1;
+    }
+    runShell([NSString stringWithFormat:@"chmod 600 %@; chown mobile:mobile %@",
+                                         kLanConfigPath, kLanConfigPath]);
+    int rc = cmdRestartDaemon();
+    if (rc == 0) {
+        printf("LAN enabled on %s:%u\n", bindAddress.UTF8String, IOSPY_DEFAULT_PORT);
+        printf("New Macs pair with a four-digit code shown by SpringBoard.\n");
+    }
+    return rc;
+}
+
+static int cmdLanDisable(void) {
+    NSDictionary *config = @{@"BindAddress": @"127.0.0.1"};
+    if (![config writeToFile:kLanConfigPath atomically:YES]) return 1;
+    return cmdRestartDaemon();
+}
+
+static int cmdLanStatus(void) {
+    NSDictionary *config = [NSDictionary dictionaryWithContentsOfFile:kLanConfigPath];
+    if (!config) {
+        printf("LAN enabled on 0.0.0.0:%u (default)\n", IOSPY_DEFAULT_PORT);
+        return 0;
+    }
+    NSString *bind = [config[@"BindAddress"] description];
+    BOOL enabled = ![bind isEqualToString:@"127.0.0.1"];
+    printf("LAN %s on %s:%u\n", enabled ? "enabled" : "disabled",
+           bind.UTF8String, IOSPY_DEFAULT_PORT);
+    NSDictionary *trust = [NSDictionary dictionaryWithContentsOfFile:kTrustPath];
+    printf("trusted Macs: %lu\n", (unsigned long)trust.count);
+    return enabled ? 0 : 1;
+}
+
+static int cmdTrustClear(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:kTrustPath error:nil];
+    int rc = cmdRestartDaemon();
+    if (rc == 0) printf("cleared all paired Mac trust records\n");
+    return rc;
+}
+
+static int cmdDisplayRestore(void) {
+    uint8_t black = 0;
+    int rc = sendPrivilegedMessage(IOSPYMsgDisplayMode,
+                                   [NSData dataWithBytes:&black length:1]);
+    if (rc == 0) {
+        printf("requested physical display restore\n");
+    } else {
+        fprintf(stderr, "could not reach ioscpyhook; try sbreload\n");
+    }
+    return rc;
+}
+
 static void usage(void) {
     printf("usage: ioscpyctl <command>\n");
     printf("  status              device + daemon + tweak summary\n");
@@ -164,6 +260,11 @@ static void usage(void) {
     printf("  reload-hooks        respring to reload the tweak\n");
     printf("  repair-permissions  fix exec bits / ownership\n");
     printf("  export-diagnostics  bundle logs into /tmp\n");
+    printf("  lan-enable [ADDR]   enable paired LAN TCP (default 0.0.0.0)\n");
+    printf("  lan-disable         return to loopback/USB-only mode\n");
+    printf("  lan-status          show LAN configuration without printing token\n");
+    printf("  trust-clear         revoke every paired Mac\n");
+    printf("  display-restore     emergency exit from remote black-screen mode\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -188,6 +289,17 @@ int main(int argc, char *argv[]) {
             return cmdRepairPermissions();
         } else if ([cmd isEqualToString:@"export-diagnostics"]) {
             return cmdExportDiagnostics();
+        } else if ([cmd isEqualToString:@"lan-enable"]) {
+            NSString *bind = argc >= 3 ? [NSString stringWithUTF8String:argv[2]] : @"0.0.0.0";
+            return cmdLanEnable(bind);
+        } else if ([cmd isEqualToString:@"lan-disable"]) {
+            return cmdLanDisable();
+        } else if ([cmd isEqualToString:@"lan-status"]) {
+            return cmdLanStatus();
+        } else if ([cmd isEqualToString:@"trust-clear"]) {
+            return cmdTrustClear();
+        } else if ([cmd isEqualToString:@"display-restore"]) {
+            return cmdDisplayRestore();
         }
         usage();
         return 2;

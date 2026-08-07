@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 struct IoscpyH264Decoder {
     CMVideoFormatDescriptionRef format;
@@ -21,15 +22,22 @@ struct IoscpyH264Decoder {
     size_t spsLen;
     uint8_t *pps;
     size_t ppsLen;
-    // reusable tightly packed BGRA output buffer
+    // The VideoToolbox callback writes the newest tightly packed BGRA frame to
+    // `latest`; the Rust polling API copies it into `out` under the mutex so the
+    // callback can immediately continue with the next frame.
+    pthread_mutex_t outputLock;
+    uint8_t *latest;
+    size_t latestCap;
+    int latestW;
+    int latestH;
+    uint64_t latestSeq;
     uint8_t *out;
     size_t outCap;
     int outW;
     int outH;
+    uint64_t takenSeq;
     // set after a decode error so the next keyframe forces a fresh session
     int needRebuild;
-    // the frame the output callback captured for the in-flight decode
-    CVPixelBufferRef decoded;
 };
 
 typedef struct IoscpyH264Decoder IoscpyH264Decoder;
@@ -45,19 +53,50 @@ static void decodeOutput(void *decoderRefCon, void *frameRefCon, OSStatus status
     if (status != noErr || imageBuffer == NULL) {
         return;
     }
-    if (dec->decoded) {
-        CVPixelBufferRelease(dec->decoded);
+    CVPixelBufferRef pb = (CVPixelBufferRef)imageBuffer;
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    int w = (int)CVPixelBufferGetWidth(pb);
+    int h = (int)CVPixelBufferGetHeight(pb);
+    size_t srcStride = CVPixelBufferGetBytesPerRow(pb);
+    const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+
+    if (w > 0 && h > 0 && base) {
+        size_t need = (size_t)w * (size_t)h * 4;
+        pthread_mutex_lock(&dec->outputLock);
+        if (dec->latestCap < need) {
+            uint8_t *grown = (uint8_t *)realloc(dec->latest, need);
+            if (grown) {
+                dec->latest = grown;
+                dec->latestCap = need;
+            }
+        }
+        if (dec->latestCap >= need) {
+            size_t dstStride = (size_t)w * 4;
+            for (int y = 0; y < h; y++) {
+                memcpy(dec->latest + (size_t)y * dstStride,
+                       base + (size_t)y * srcStride, dstStride);
+            }
+            dec->latestW = w;
+            dec->latestH = h;
+            dec->latestSeq++;
+        }
+        pthread_mutex_unlock(&dec->outputLock);
     }
-    dec->decoded = (CVPixelBufferRef)CVPixelBufferRetain(imageBuffer);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 }
 
 IoscpyH264Decoder *ioscpy_h264_decoder_new(void) {
     IoscpyH264Decoder *dec = (IoscpyH264Decoder *)calloc(1, sizeof(IoscpyH264Decoder));
+    if (dec) {
+        pthread_mutex_init(&dec->outputLock, NULL);
+    }
     return dec;
 }
 
 static void teardownSession(IoscpyH264Decoder *dec) {
     if (dec->session) {
+        VTDecompressionSessionFinishDelayedFrames(dec->session);
+        VTDecompressionSessionWaitForAsynchronousFrames(dec->session);
         VTDecompressionSessionInvalidate(dec->session);
         CFRelease(dec->session);
         dec->session = NULL;
@@ -73,12 +112,11 @@ void ioscpy_h264_decoder_free(IoscpyH264Decoder *dec) {
         return;
     }
     teardownSession(dec);
-    if (dec->decoded) {
-        CVPixelBufferRelease(dec->decoded);
-    }
     free(dec->sps);
     free(dec->pps);
+    free(dec->latest);
     free(dec->out);
+    pthread_mutex_destroy(&dec->outputLock);
     free(dec);
 }
 
@@ -129,8 +167,7 @@ static void storeParam(uint8_t **dst, size_t *dstLen, const uint8_t *src, size_t
     *dstLen = buf ? len : 0;
 }
 
-int ioscpy_h264_decoder_decode(IoscpyH264Decoder *dec, const uint8_t *avcc, size_t len,
-                               const uint8_t **out_bgra, int *out_w, int *out_h) {
+int ioscpy_h264_decoder_decode(IoscpyH264Decoder *dec, const uint8_t *avcc, size_t len) {
     if (!dec || !avcc) {
         return -1;
     }
@@ -220,59 +257,47 @@ int ioscpy_h264_decoder_decode(IoscpyH264Decoder *dec, const uint8_t *avcc, size
         return -1;
     }
 
-    if (dec->decoded) {
-        CVPixelBufferRelease(dec->decoded);
-        dec->decoded = NULL;
-    }
-
     VTDecodeInfoFlags infoOut = 0;
-    s = VTDecompressionSessionDecodeFrame(dec->session, sampleBuf, 0, NULL, &infoOut);
-    if (s == noErr) {
-        VTDecompressionSessionWaitForAsynchronousFrames(dec->session);
-    }
+    s = VTDecompressionSessionDecodeFrame(dec->session, sampleBuf,
+                                          kVTDecodeFrame_EnableAsynchronousDecompression,
+                                          NULL, &infoOut);
     CFRelease(sampleBuf);
     if (s != noErr) {
         dec->needRebuild = 1; // rebuild on the next keyframe
         return -1;
     }
-    if (!dec->decoded) {
-        return 0; // decoded but no image this time
-    }
+    return (infoOut & kVTDecodeInfo_FrameDropped) ? 0 : 1;
+}
 
-    CVPixelBufferRef pb = dec->decoded;
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    int w = (int)CVPixelBufferGetWidth(pb);
-    int h = (int)CVPixelBufferGetHeight(pb);
-    size_t srcStride = CVPixelBufferGetBytesPerRow(pb);
-    const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
-
-    int ok = 0;
-    if (w > 0 && h > 0 && base) {
-        size_t need = (size_t)w * (size_t)h * 4;
-        if (dec->outCap < need) {
-            uint8_t *grown = (uint8_t *)realloc(dec->out, need);
-            if (grown) {
-                dec->out = grown;
-                dec->outCap = need;
-            }
-        }
-        if (dec->outCap >= need) {
-            size_t dstStride = (size_t)w * 4;
-            for (int y = 0; y < h; y++) {
-                memcpy(dec->out + (size_t)y * dstStride, base + (size_t)y * srcStride, dstStride);
-            }
-            dec->outW = w;
-            dec->outH = h;
-            ok = 1;
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    CVPixelBufferRelease(dec->decoded);
-    dec->decoded = NULL;
-
-    if (!ok) {
+int ioscpy_h264_decoder_take(IoscpyH264Decoder *dec, const uint8_t **out_bgra,
+                              int *out_w, int *out_h) {
+    if (!dec) {
         return -1;
     }
+    pthread_mutex_lock(&dec->outputLock);
+    if (dec->latestSeq == dec->takenSeq || dec->latestW <= 0 || dec->latestH <= 0) {
+        pthread_mutex_unlock(&dec->outputLock);
+        return 0;
+    }
+
+    size_t need = (size_t)dec->latestW * (size_t)dec->latestH * 4;
+    if (dec->outCap < need) {
+        uint8_t *grown = (uint8_t *)realloc(dec->out, need);
+        if (grown) {
+            dec->out = grown;
+            dec->outCap = need;
+        }
+    }
+    if (dec->outCap < need) {
+        pthread_mutex_unlock(&dec->outputLock);
+        return -1;
+    }
+    memcpy(dec->out, dec->latest, need);
+    dec->outW = dec->latestW;
+    dec->outH = dec->latestH;
+    dec->takenSeq = dec->latestSeq;
+    pthread_mutex_unlock(&dec->outputLock);
+
     if (out_bgra) {
         *out_bgra = dec->out;
     }
