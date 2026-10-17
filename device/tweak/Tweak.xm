@@ -55,6 +55,18 @@ static BOOL gSuppressPasteAlert = NO;
 
 %end
 
+static void onSpringBoardLaunched(CFNotificationCenterRef center, void *observer,
+                                  CFStringRef name, const void *object,
+                                  CFDictionaryRef userInfo) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSLog(@"[ioscpyhook] SpringBoard did launch; starting services");
+        IOSPYOrientationStart();
+        IOSPYKeyboardSuppressionInit();
+        [[IOSPYStreamClient shared] start];
+    });
+}
+
 %ctor {
     @autoreleasepool {
         NSString *process = [[NSProcessInfo processInfo] processName];
@@ -70,8 +82,21 @@ static BOOL gSuppressPasteAlert = NO;
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
         gSuppressPasteAlert = (v.majorVersion >= 16);
 
-        IOSPYOrientationStart();
-        IOSPYKeyboardSuppressionInit();
-        [[IOSPYStreamClient shared] start];
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            NULL,
+            onSpringBoardLaunched,
+            CFSTR("SBSpringBoardDidLaunchNotification"),
+            NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately
+        );
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetLocalCenter(),
+            NULL,
+            onSpringBoardLaunched,
+            CFSTR("SBSpringBoardDidLaunchNotification"),
+            NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately
+        );
     }
 }

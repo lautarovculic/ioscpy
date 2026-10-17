@@ -45,14 +45,9 @@ void IOSPYKeyboardSuppressionInit(void) {
         sIs = (Boolean (*)(void))dlsym(gs, "GSEventIsHardwareKeyboardAttached");
         gAvailable = (sSet3 != NULL || sSet2 != NULL);
 
-        // Fresh SpringBoard with no ioscpy session yet: clear any stale hidden
-        // state a crashed previous instance could have left, so the device never
-        // boots keyboard-less. (A real keyboard is re-detected by the system right
-        // after, so this doesn't fight one.)
         if (gAvailable) {
             gActive = NO;
             gPriorAttached = NO;
-            applyAttached(NO);
         }
     });
 }

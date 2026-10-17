@@ -38,6 +38,7 @@ static uint64_t clipHash(NSString *t) {
 
 @interface IOSPYStreamClient ()
 - (void)startClipboardObserver;
+- (void)stopClipboardObserver;
 - (void)checkClipboard;
 - (void)applyRemoteClipboard:(NSString *)text paste:(BOOL)paste;
 - (void)sendClipboardChanged:(NSString *)text;
@@ -68,7 +69,6 @@ static uint64_t clipHash(NSString *t) {
         _fd = -1;
         _captureQueue = dispatch_queue_create("com.ioscpy.capture", DISPATCH_QUEUE_SERIAL);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
-        [self startClipboardObserver];
     }
     return self;
 }
@@ -77,6 +77,9 @@ static uint64_t clipHash(NSString *t) {
 // access runs on _clipQueue (a dispatch-source timer, no main runloop) so a
 // Handoff or Universal Clipboard stall on .string can never wedge SpringBoard.
 - (void)startClipboardObserver {
+    if (_clipTimer) {
+        return;
+    }
     _clipTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _clipQueue);
     dispatch_source_set_timer(_clipTimer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                               NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
@@ -84,6 +87,13 @@ static uint64_t clipHash(NSString *t) {
         [self checkClipboard];
     });
     dispatch_resume(_clipTimer);
+}
+
+- (void)stopClipboardObserver {
+    if (_clipTimer) {
+        dispatch_source_cancel(_clipTimer);
+        _clipTimer = nil;
+    }
 }
 
 // Runs on _clipQueue (off the main thread).
@@ -168,6 +178,7 @@ static uint64_t clipHash(NSString *t) {
         // keyboard hidden behind a dead session.
         dispatch_async(dispatch_get_main_queue(), ^{ IOSPYSetKeyboardSuppressed(NO); });
         dispatch_async(_captureQueue, ^{ [self stopCapture]; });
+        dispatch_async(_clipQueue, ^{ [self stopClipboardObserver]; });
         _fd = -1;
         close(fd);
         sleep(1);
@@ -212,8 +223,10 @@ static uint64_t clipHash(NSString *t) {
                 self->_needKeyframe = YES;
                 [self startCapture];
             });
+            dispatch_async(_clipQueue, ^{ [self startClipboardObserver]; });
         } else if (header.type == IOSPYMsgStopStream) {
             dispatch_async(_captureQueue, ^{ [self stopCapture]; });
+            dispatch_async(_clipQueue, ^{ [self stopClipboardObserver]; });
         } else if (header.type == IOSPYMsgRequestKeyframe) {
             dispatch_async(_captureQueue, ^{ self->_needKeyframe = YES; });
         } else if (header.type == IOSPYMsgInputTouch && payload.length >= 10) {

@@ -3,6 +3,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <ImageIO/ImageIO.h>
 #import <MobileCoreServices/MobileCoreServices.h>
+#import <CoreServices/UTCoreTypes.h>
 #import <dlfcn.h>
 
 // The render server can blit the live display straight into an IOSurface. It's
