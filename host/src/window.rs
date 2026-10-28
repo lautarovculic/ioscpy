@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use fast_image_resize::images::{Image, ImageRef};
+use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use minifb::{MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 
 use crate::clipboard;
@@ -75,7 +77,11 @@ fn paste_now(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
 
 /// Translate a sidebar button press into the same messages its matching
 /// keyboard shortcut sends.
-fn dispatch_sidebar_action(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>, action: sidebar::Action) {
+fn dispatch_sidebar_action(
+    tx: &Sender<InputFrame>,
+    clip: &Arc<Mutex<ClipState>>,
+    action: sidebar::Action,
+) {
     use sidebar::Action::*;
     match action {
         Home => send_action(tx, SystemAction::Home),
@@ -266,9 +272,10 @@ impl minifb::InputCallback for TextForwarder {
         }
         if let Some(c) = char::from_u32(uni_char) {
             if !c.is_control() {
-                let _ = self
-                    .tx
-                    .send(InputFrame::new(MessageType::InputText, protocol::encode_text(&c.to_string())));
+                let _ = self.tx.send(InputFrame::new(
+                    MessageType::InputText,
+                    protocol::encode_text(&c.to_string()),
+                ));
             }
         }
     }
@@ -517,7 +524,61 @@ fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize
     }
 }
 
-/// Bilinear blend of four `0x00RRGGBB` pixels.
+/// SIMD path for the content area. Returns false when the resizer can't accept
+/// the buffers (for example on an unexpected pixel format), so the caller can
+/// fall back to the scalar scaler above.
+#[allow(clippy::too_many_arguments)]
+fn scale_frame_fast(
+    src: &DecodedFrame,
+    content_w: usize,
+    out_h: usize,
+    stride: usize,
+    dst: &mut [u32],
+    resizer: &mut Resizer,
+    opts: &ResizeOptions,
+    scratch: &mut Vec<u32>,
+) -> bool {
+    let content_w = content_w.max(1);
+    let out_h = out_h.max(1);
+    let scale = (content_w as f32 / src.width as f32).min(out_h as f32 / src.height as f32);
+    let dw = ((src.width as f32 * scale) as usize).clamp(1, content_w);
+    let dh = ((src.height as f32 * scale) as usize).clamp(1, out_h);
+    if dw == 0 || dh == 0 {
+        return false;
+    }
+    let x_off = (content_w - dw) / 2;
+    let y_off = (out_h - dh) / 2;
+
+    let src_bytes: &[u8] = bytemuck::cast_slice(&src.buf);
+    let Ok(src_img) = ImageRef::new(
+        src.width as u32,
+        src.height as u32,
+        src_bytes,
+        PixelType::U8x4,
+    ) else {
+        return false;
+    };
+
+    scratch.resize(dw * dh, 0);
+    let dst_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut scratch[..dw * dh]);
+    let Ok(mut dst_img) = Image::from_slice_u8(dw as u32, dh as u32, dst_bytes, PixelType::U8x4)
+    else {
+        return false;
+    };
+    if resizer.resize(&src_img, &mut dst_img, opts).is_err() {
+        return false;
+    }
+
+    // The window buffer is wider than the content (sidebar on the right) and
+    // letterboxed vertically, so copy the resized rows into place.
+    for y in 0..dh {
+        let src_row = &scratch[y * dw..(y + 1) * dw];
+        let dst_start = (y + y_off) * stride + x_off;
+        dst[dst_start..dst_start + dw].copy_from_slice(src_row);
+    }
+    true
+}
+
 #[inline]
 fn bilerp(p00: u32, p10: u32, p01: u32, p11: u32, wx: f32, wy: f32) -> u32 {
     let mut out = 0u32;
@@ -570,10 +631,25 @@ pub fn run_window(
     let mut input = InputState::default();
     let mut combined: Vec<u32> = Vec::new();
     let mut last_clip_poll = Instant::now();
+    // The device sends ~43-45 fps, so the window loop re-renders only when the
+    // picture, the window size, or the sidebar highlight actually changes.
+    // `window.update()` keeps the event loop alive (and paced at 60 fps) on the
+    // frames where there is nothing new to present.
+    let mut dirty = true;
+    let mut last_size = window.get_size();
+    let mut last_sidebar = None;
+    let mut resizer = Resizer::new();
+    let resizer_opts = ResizeOptions::new().use_alpha(false);
+    let mut scale_scratch: Vec<u32> = Vec::new();
     while window.is_open() && !stop.load(Ordering::Relaxed) {
         // Take the newest decoded frame, dropping any older one.
+        let mut new_frame = false;
         if let Some(decoded) = frames.lock().unwrap().take() {
             current = decoded;
+            new_frame = true;
+        }
+        if new_frame {
+            dirty = true;
         }
 
         // If the frame's shape flipped the phone rotated. Reopen the window at the
@@ -587,42 +663,84 @@ pub fn run_window(
                 w.set_position(pos.0, pos.1);
                 attach_text_input(&mut w, &input_tx);
                 window = w;
+                last_size = window.get_size();
+                dirty = true;
             }
         }
 
         // Window points: the sidebar is a fixed-width strip on the right, the
         // device frame and touch mapping get whatever's left.
         let (gw, gh) = window.get_size();
+        if (gw, gh) != last_size {
+            last_size = (gw, gh);
+            dirty = true;
+        }
         let content_w = gw.saturating_sub(sidebar::WIDTH).max(1);
 
-        let input_ctx = InputCtx { content_w, win_h: gh, tx: &input_tx, clip: &clip };
+        let input_ctx = InputCtx {
+            content_w,
+            win_h: gh,
+            tx: &input_tx,
+            clip: &clip,
+        };
         pump_input(&window, &current, &mut input, &input_ctx);
         #[cfg(not(target_os = "macos"))]
         pump_keys(&window, &input_tx, &clip);
+        if input.sidebar_down != last_sidebar {
+            last_sidebar = input.sidebar_down;
+            dirty = true;
+        }
 
-        // Render a window-sized, letterboxed buffer at the backing (retina)
-        // resolution for minifb to blit 1:1. Both axes are capped together so a
-        // huge window keeps its aspect (and per-frame cost bounded) under Stretch.
-        // Content and sidebar are written directly into one shared buffer, side
-        // by side, instead of composing separate buffers and copying them
-        // together every frame.
-        let bs = backing_scale(&window);
-        let ow = (content_w as f32 * bs).max(1.0);
-        let oh = (gh as f32 * bs).max(1.0);
-        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs)).min(2600.0 / oh).min(1.0);
-        let content_px = ((ow * down) as usize).max(1);
-        let total_h = ((oh * down) as usize).max(1);
-        let sb_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
-        let stride = content_px + sb_px;
+        if dirty {
+            // Render a window-sized, letterboxed buffer at the backing (retina)
+            // resolution for minifb to blit 1:1. Both axes are capped together so a
+            // huge window keeps its aspect (and per-frame cost bounded) under Stretch.
+            // Content and sidebar are written directly into one shared buffer, side
+            // by side, instead of composing separate buffers and copying them
+            // together every frame.
+            let bs = backing_scale(&window);
+            let ow = (content_w as f32 * bs).max(1.0);
+            let oh = (gh as f32 * bs).max(1.0);
+            let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs))
+                .min(2600.0 / oh)
+                .min(1.0);
+            let content_px = ((ow * down) as usize).max(1);
+            let total_h = ((oh * down) as usize).max(1);
+            let sb_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
+            let stride = content_px + sb_px;
 
-        combined.clear();
-        combined.resize(stride * total_h, 0);
-        scale_frame(&current, content_px, total_h, stride, &mut combined);
-        sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
+            combined.clear();
+            combined.resize(stride * total_h, 0);
+            if !scale_frame_fast(
+                &current,
+                content_px,
+                total_h,
+                stride,
+                &mut combined,
+                &mut resizer,
+                &resizer_opts,
+                &mut scale_scratch,
+            ) {
+                scale_frame(&current, content_px, total_h, stride, &mut combined);
+            }
+            sidebar::draw_into(
+                &mut combined,
+                stride,
+                content_px,
+                sb_px,
+                total_h,
+                input.sidebar_down,
+            );
 
-        window
-            .update_with_buffer(&combined, stride, total_h)
-            .context("failed to present a frame")?;
+            window
+                .update_with_buffer(&combined, stride, total_h)
+                .context("failed to present a frame")?;
+            dirty = false;
+        } else {
+            // No new picture: keep processing window events and pacing without
+            // re-scaling/re-uploading the same frame.
+            window.update();
+        }
 
         // Push Mac clipboard changes to the device (rate-limited).
         if last_clip_poll.elapsed() >= Duration::from_millis(300) {
@@ -684,7 +802,14 @@ fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx
     };
 
     if state.touching {
-        let (nx, ny) = map_to_norm(pos.0, pos.1, ctx.content_w, ctx.win_h, frame.width, frame.height);
+        let (nx, ny) = map_to_norm(
+            pos.0,
+            pos.1,
+            ctx.content_w,
+            ctx.win_h,
+            frame.width,
+            frame.height,
+        );
         if (nx - state.last.0).abs() > 0.001 || (ny - state.last.1).abs() > 0.001 {
             // Only emit a move when the position actually changes.
             send_touch(ctx.tx, TouchPhase::Move, nx, ny);
@@ -702,7 +827,12 @@ fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx
 
 /// A press that wasn't already tracked as a touch or a held button: route it
 /// to a touch-down or a sidebar button depending on where it landed.
-fn handle_fresh_press(pos: (f32, f32), frame: &DecodedFrame, state: &mut InputState, ctx: &InputCtx) {
+fn handle_fresh_press(
+    pos: (f32, f32),
+    frame: &DecodedFrame,
+    state: &mut InputState,
+    ctx: &InputCtx,
+) {
     let (mx, my) = pos;
     if (mx as usize) < ctx.content_w {
         let (nx, ny) = map_to_norm(mx, my, ctx.content_w, ctx.win_h, frame.width, frame.height);
@@ -731,4 +861,46 @@ fn wait_for_first_frame(frames: &FrameSlot, stop: &Arc<AtomicBool>) -> Option<De
         std::thread::sleep(Duration::from_millis(20));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_scaler_fills_content_and_leaves_letterbox_clear() {
+        // 4x2 solid source in an 8x8 content area: scale = 2, so the image is
+        // 8x4 and sits in rows 2..6. Column 8..10 is the sidebar budget.
+        let src = DecodedFrame {
+            buf: vec![0x0011_2233; 4 * 2],
+            width: 4,
+            height: 2,
+        };
+        let mut dst = vec![0u32; 10 * 8];
+        let mut resizer = Resizer::new();
+        let opts = ResizeOptions::new().use_alpha(false);
+        let mut scratch = Vec::new();
+
+        assert!(scale_frame_fast(
+            &src,
+            8,
+            8,
+            10,
+            &mut dst,
+            &mut resizer,
+            &opts,
+            &mut scratch,
+        ));
+
+        for y in 0..8 {
+            for x in 0..10 {
+                let px = dst[y * 10 + x];
+                if (2..6).contains(&y) && x < 8 {
+                    assert_eq!(px & 0x00FF_FFFF, 0x0011_2233, "content pixel at {x},{y}");
+                } else {
+                    assert_eq!(px, 0, "letterbox/sidebar pixel at {x},{y}");
+                }
+            }
+        }
+    }
 }

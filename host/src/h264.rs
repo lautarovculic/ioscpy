@@ -100,14 +100,15 @@ impl Drop for H264Decoder {
 
 #[cfg(not(target_os = "macos"))]
 use openh264::{decoder::Decoder, formats::YUVSource};
+#[cfg(not(target_os = "macos"))]
+use yuvutils_rs::{yuv420_to_bgra, YuvPlanarImage, YuvRange, YuvStandardMatrix};
 
 #[cfg(not(target_os = "macos"))]
 pub struct H264Decoder {
     inner: Decoder,
-    // Reused between frames so the per-frame conversion is a copy, not an
+    // Reused between frames so the Annex-B conversion is a copy, not an
     // allocation.
     annex_b: Vec<u8>,
-    rgb: Vec<u8>,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -139,7 +140,6 @@ impl H264Decoder {
         Decoder::new().ok().map(|inner| Self {
             inner,
             annex_b: Vec::new(),
-            rgb: Vec::new(),
         })
     }
 
@@ -150,13 +150,45 @@ impl H264Decoder {
         match self.inner.decode(&self.annex_b) {
             Ok(Some(yuv)) => {
                 let (width, height) = yuv.dimensions();
-                let needed = width * height * 3;
-                if self.rgb.len() < needed {
-                    self.rgb.resize(needed, 0);
+                let (sy, su, sv) = yuv.strides();
+                let src = YuvPlanarImage {
+                    y_plane: yuv.y(),
+                    y_stride: sy as u32,
+                    u_plane: yuv.u(),
+                    u_stride: su as u32,
+                    v_plane: yuv.v(),
+                    v_stride: sv as u32,
+                    width: width as u32,
+                    height: height as u32,
+                };
+
+                // One SIMD pass writes BGRA straight into the window's u32
+                // frame. openh264's own write_rgb8 (0.9.x) falls back to scalar
+                // when width % 8 != 0, which is the case for every 738x1600
+                // device frame.
+                let mut buf = vec![0u32; width * height];
+                let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut buf);
+                match yuv420_to_bgra(
+                    &src,
+                    dst,
+                    (width * 4) as u32,
+                    YuvRange::Limited,
+                    YuvStandardMatrix::Bt601,
+                ) {
+                    Ok(()) => {
+                        // Keep the frame contract 0x00RRGGBB. minifb ignores the
+                        // high byte on every backend we use, but masking keeps
+                        // the buffer identical to the JPEG path.
+                        for px in &mut buf {
+                            *px &= 0x00FF_FFFF;
+                        }
+                        Decoded::Frame(DecodedFrame { buf, width, height })
+                    }
+                    Err(e) => {
+                        crate::warn!("h264 color conversion failed: {e}");
+                        Decoded::Failed
+                    }
                 }
-                yuv.write_rgb8(&mut self.rgb[..needed]);
-                let buf = crate::video::pack_rgb888(&self.rgb, width, height);
-                Decoded::Frame(DecodedFrame { buf, width, height })
             }
             Ok(None) => Decoded::Pending,
             Err(e) => {
