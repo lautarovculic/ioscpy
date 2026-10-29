@@ -524,10 +524,12 @@ fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize
     }
 }
 
-/// Options for `scale_frame_fast`. Bilinear matches the scalar fallback and is
-/// ~2.4x cheaper than the crate's default Lanczos3 at this downscale. Alpha is
-/// ignored because frames carry 0x00RRGGBB, and premultiplying by a zero alpha
-/// would black out the picture.
+/// Options for `scale_frame_fast`. Bilinear is closer to the scalar fallback
+/// and cheaper than the crate's default Lanczos3 (1.9-2.4x faster in our
+/// measurements; the ratio depends on the CPU). It isn't bit-exact with
+/// `scale_frame`: the convolution widens its support when downscaling, while
+/// `bilerp` always samples 2 taps. Alpha is ignored because frames carry
+/// 0x00RRGGBB, and premultiplying by a zero alpha would black out the picture.
 fn fast_resize_options() -> ResizeOptions {
     ResizeOptions::new()
         .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
