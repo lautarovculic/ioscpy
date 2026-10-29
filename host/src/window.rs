@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use fast_image_resize::images::{Image, ImageRef};
-use fast_image_resize::{PixelType, ResizeOptions, Resizer};
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use minifb::{MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 
 use crate::clipboard;
@@ -524,6 +524,16 @@ fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize
     }
 }
 
+/// Options for `scale_frame_fast`. Bilinear matches the scalar fallback and is
+/// ~2.4x cheaper than the crate's default Lanczos3 at this downscale. Alpha is
+/// ignored because frames carry 0x00RRGGBB, and premultiplying by a zero alpha
+/// would black out the picture.
+fn fast_resize_options() -> ResizeOptions {
+    ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
+        .use_alpha(false)
+}
+
 /// SIMD path for the content area. Returns false when the resizer can't accept
 /// the buffers (for example on an unexpected pixel format), so the caller can
 /// fall back to the scalar scaler above.
@@ -543,9 +553,6 @@ fn scale_frame_fast(
     let scale = (content_w as f32 / src.width as f32).min(out_h as f32 / src.height as f32);
     let dw = ((src.width as f32 * scale) as usize).clamp(1, content_w);
     let dh = ((src.height as f32 * scale) as usize).clamp(1, out_h);
-    if dw == 0 || dh == 0 {
-        return false;
-    }
     let x_off = (content_w - dw) / 2;
     let y_off = (out_h - dh) / 2;
 
@@ -639,16 +646,12 @@ pub fn run_window(
     let mut last_size = window.get_size();
     let mut last_sidebar = None;
     let mut resizer = Resizer::new();
-    let resizer_opts = ResizeOptions::new().use_alpha(false);
+    let resizer_opts = fast_resize_options();
     let mut scale_scratch: Vec<u32> = Vec::new();
     while window.is_open() && !stop.load(Ordering::Relaxed) {
         // Take the newest decoded frame, dropping any older one.
-        let mut new_frame = false;
         if let Some(decoded) = frames.lock().unwrap().take() {
             current = decoded;
-            new_frame = true;
-        }
-        if new_frame {
             dirty = true;
         }
 
@@ -878,7 +881,7 @@ mod tests {
         };
         let mut dst = vec![0u32; 10 * 8];
         let mut resizer = Resizer::new();
-        let opts = ResizeOptions::new().use_alpha(false);
+        let opts = fast_resize_options();
         let mut scratch = Vec::new();
 
         assert!(scale_frame_fast(
