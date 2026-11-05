@@ -4,7 +4,9 @@
 #import <ImageIO/ImageIO.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <CoreServices/UTCoreTypes.h>
+#import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
+#include <math.h>
 
 // The render server can blit the live display straight into an IOSurface. It's
 // a long-standing private QuartzCore entry point; we resolve it at runtime so a
@@ -68,6 +70,73 @@ static CFStringRef mainDisplayName(void) {
         name = (CFStringRef)CFBridgingRetain(resolved);
     });
     return name;
+}
+
+// Snapshot can render at the encoder's size, avoiding a full-resolution source
+// and the CPU downscale below. All private symbols are optional: older systems
+// keep using RenderDisplay when the entry point or any option is unavailable.
+struct SnapshotAPI {
+    bool (*render)(uint32_t, CFDictionaryRef);
+    CFStringRef mode, displayMode, displayName, destination, originX, originY, transform;
+};
+
+static CFStringRef snapshotConstant(const char *name) {
+    const CFStringRef *value = (const CFStringRef *)dlsym(RTLD_DEFAULT, name);
+    return value ? *value : NULL;
+}
+
+static const SnapshotAPI *snapshotAPI(void) {
+    static SnapshotAPI api = {};
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        api.render = (bool (*)(uint32_t, CFDictionaryRef))dlsym(RTLD_DEFAULT, "CARenderServerSnapshot");
+        api.mode = snapshotConstant("kCASnapshotMode");
+        api.displayMode = snapshotConstant("kCASnapshotModeDisplay");
+        api.displayName = snapshotConstant("kCASnapshotDisplayName");
+        api.destination = snapshotConstant("kCASnapshotDestination");
+        api.originX = snapshotConstant("kCASnapshotOriginX");
+        api.originY = snapshotConstant("kCASnapshotOriginY");
+        api.transform = snapshotConstant("kCASnapshotTransform");
+    });
+    return api.render && api.mode && api.displayMode && api.displayName &&
+           api.destination && api.originX && api.originY && api.transform ? &api : NULL;
+}
+
+static BOOL snapshotIntoSurface(IOSurfaceRef surface, CGSize native, int width, int height) {
+    const SnapshotAPI *api = snapshotAPI();
+    if (!api) return NO;
+
+    static CGFloat scale = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if ([NSThread isMainThread]) {
+            scale = [UIScreen mainScreen].nativeScale;
+        } else {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                scale = [UIScreen mainScreen].nativeScale;
+            });
+        }
+    });
+    if (!isfinite(scale) || scale <= 0) return NO;
+
+    // Snapshot's transform is in logical display coordinates. nativeScale also
+    // handles devices whose physical pixel size differs from UIKit's scale.
+    CATransform3D transform = CATransform3DMakeScale(
+        width * scale / native.width, height * scale / native.height, 1);
+    NSDictionary *options = @{
+        (__bridge id)api->mode: (__bridge id)api->displayMode,
+        (__bridge id)api->displayName: (__bridge id)mainDisplayName(),
+        (__bridge id)api->destination: (__bridge id)surface,
+        (__bridge id)api->originX: @0, (__bridge id)api->originY: @0,
+        (__bridge id)api->transform: [NSValue valueWithCATransform3D:transform],
+    };
+    // Use the exported display-mode object, not a reconstructed string: some
+    // versions of the render server compare this value by identity.
+    if (!api->render(0, (__bridge CFDictionaryRef)options)) return NO;
+
+    // Wait for the producer before returning the surface to VideoToolbox.
+    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) return NO;
+    return IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL) == KERN_SUCCESS;
 }
 
 // Reusable destination surface, recreated only when the target size changes.
@@ -144,9 +213,18 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
         if (tw < 2) tw = 2;
         if (th < 2) th = 2;
 
-        IOSurfaceRef src = surfaceForSize(nw, nh);
         IOSurfaceRef dst = destSurfaceForSize(tw, th);
-        if (!src || !dst) {
+        if (!dst) {
+            return NULL;
+        }
+        if (snapshotIntoSurface(dst, native, tw, th)) {
+            if (outWidth) *outWidth = tw;
+            if (outHeight) *outHeight = th;
+            return dst;
+        }
+
+        IOSurfaceRef src = surfaceForSize(nw, nh);
+        if (!src) {
             return NULL;
         }
 
